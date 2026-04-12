@@ -13,11 +13,14 @@ Usage:
 """
 from __future__ import annotations
 import argparse
+import select
+import sys
+import termios
 import time
+import tty
 from typing import Dict, List
 
 import numpy as np
-from pynput import keyboard
 
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
@@ -147,33 +150,26 @@ class OmniTeleop:
         self.lin_speed = float(LIN_SPEED)
         self.ang_speed = float(ANG_SPEED)
 
-    # ---- Keyboard events ----
-    def _on_press(self, key):
-        try:
-            ch = key.char
-        except Exception:
-            ch = None
-        if ch is None:
-            if key == keyboard.Key.esc:
-                self.running = False
-            return
-        for action, bind in TELEOP_KEYS.items():
-            if ch == bind:
-                if action == "quit":
-                    self.running = False
-                else:
-                    self.pressed[action] = True
+    # ---- Keyboard input (termios) ----
+    def _read_key(self) -> str | None:
+        """Non-blocking read of a single character from stdin."""
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
 
-    def _on_release(self, key):
-        try:
-            ch = key.char
-        except Exception:
-            ch = None
-        if ch is None:
+    def _process_key(self, ch: str) -> None:
+        print(f"[key] {ch!r}")
+        if ch == TELEOP_KEYS["quit"]:
+            self.running = False
+            return
+        if ch == "\x1b":
+            # Consume rest of escape sequence (e.g. arrow keys)
+            while self._read_key() is not None:
+                pass
             return
         for action, bind in TELEOP_KEYS.items():
-            if ch == bind and action in self.pressed:
-                self.pressed[action] = False
+            if ch == bind and action != "quit":
+                self.pressed[action] = True
 
     # ---- Connect and mode switch ----
     def connect(self) -> None:
@@ -208,10 +204,21 @@ class OmniTeleop:
 
     # ---- Main loop ----
     def run(self):
-        listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
-        listener.start()
+        old_settings = termios.tcgetattr(sys.stdin)
         try:
+            tty.setcbreak(sys.stdin.fileno())
+            print("Teleop ready. Keys: W/S fwd/back, A/D strafe, Z/X rotate, Q/ESC quit")
             while self.running:
+                # Reset pressed state each tick (no release events with termios)
+                for k in self.pressed:
+                    self.pressed[k] = False
+
+                # Read all pending keys this tick
+                ch = self._read_key()
+                while ch is not None:
+                    self._process_key(ch)
+                    ch = self._read_key()
+
                 x = self.lin_speed if self.pressed.get("forward") else (-self.lin_speed if self.pressed.get("backward") else 0.0)
                 y = self.lin_speed if self.pressed.get("left")    else (-self.lin_speed if self.pressed.get("right")    else 0.0)
                 th = self.ang_speed if self.pressed.get("rotate_left") else (-self.ang_speed if self.pressed.get("rotate_right") else 0.0)
@@ -244,10 +251,10 @@ class OmniTeleop:
         except KeyboardInterrupt:
             pass
         finally:
-            listener.stop()
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
             self.stop()
             self.close()
-            print("Teleop stopped.")
+            print("\nTeleop stopped.")
 
 
 # ------------------------ CLI ------------------------ #

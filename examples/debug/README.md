@@ -1,3 +1,20 @@
+#### Web control panel (Viser + cameras)
+
+Build the React UI, sync to the robot, and start the server:
+
+```
+just viser
+```
+
+This runs three steps: `build-ui` (compiles `web-ui/` with Vite), `sync` (rsyncs to fppe), then starts `viser_control.py` on the robot.
+
+Once running:
+- **http://fppe:8091/** — React app with tabs for 3D controls and full-screen camera feeds
+- **http://fppe:8090/** — Viser 3D UI (also embedded in the Controls tab)
+- **http://fppe:8091/mjpeg/cam0**, **/mjpeg/cam1** — raw MJPEG streams
+
+To iterate on the React app locally: `cd examples/debug/web-ui && npm run dev`. Then rebuild and redeploy with `just viser`.
+
 #### View all motor states
 ```
 python examples/debug/motors.py get_motors_states \

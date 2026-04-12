@@ -3,7 +3,10 @@
 
 import time
 import argparse
-from pynput import keyboard
+import select
+import sys
+import termios
+import tty
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 
@@ -16,7 +19,7 @@ SAMPLES_TO_TRIGGER = 2      # Consecutive samples before triggering
 # ================================================= #
 
 STEPS_PER_DEG = 4096.0 / 360.0  # ≈11.377 ticks/deg
-TELEOP_KEYS = {"up": "u", "down": "j"}
+TELEOP_KEYS = {"up": "r", "down": "f"}
 pressed = {"up": False, "down": False}
 
 
@@ -27,24 +30,10 @@ def degps_to_raw(degps: float) -> int:
     return -mag if degps < 0 else mag
 
 
-def on_press(key):
-    try:
-        if key.char == TELEOP_KEYS["up"]:
-            pressed["up"] = True
-        elif key.char == TELEOP_KEYS["down"]:
-            pressed["down"] = True
-    except Exception:
-        pass
-
-
-def on_release(key):
-    try:
-        if key.char == TELEOP_KEYS["up"]:
-            pressed["up"] = False
-        elif key.char == TELEOP_KEYS["down"]:
-            pressed["down"] = False
-    except Exception:
-        pass
+def read_key():
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.read(1)
+    return None
 
 
 def main():
@@ -68,14 +57,34 @@ def main():
     except Exception:
         pass
 
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.start()
-    print(f"[INFO] Ready. U ↑ / J ↓ / Ctrl-C to quit.")
+    print(f"[INFO] Ready. R ↑ / F ↓ / Q to quit.")
     print(f"[INFO] Overcurrent cutoff: {CURRENT_CUTOFF} mA, trigger after {SAMPLES_TO_TRIGGER} samples")
 
+    old_settings = termios.tcgetattr(sys.stdin)
     over_cnt = 0
     try:
+        tty.setcbreak(sys.stdin.fileno())
         while True:
+            # Reset pressed state each tick
+            pressed["up"] = False
+            pressed["down"] = False
+
+            # Read all pending keys this tick
+            ch = read_key()
+            while ch is not None:
+                if ch == "q":
+                    return
+                if ch == "\x1b":
+                    # Consume rest of escape sequence (e.g. arrow keys)
+                    while read_key() is not None:
+                        pass
+                    break
+                if ch == TELEOP_KEYS["up"]:
+                    pressed["up"] = True
+                elif ch == TELEOP_KEYS["down"]:
+                    pressed["down"] = True
+                ch = read_key()
+
             # 1) Read current
             try:
                 raw_current_ma = bus.read("Present_Current", name, normalize=False)
@@ -128,6 +137,7 @@ def main():
         except Exception:
             pass
     finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         try:
             bus.disconnect(disable_torque=False)
         except Exception:

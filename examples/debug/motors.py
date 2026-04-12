@@ -17,7 +17,7 @@ HALF_TURN_DEGREE = 180
 GENERAL_ACTIONS = {"sleep", "print"}
 DEFAULT_FEETECH_MODEL = "sts3215"
 SCAN_START = 1
-SCAN_END = 22
+SCAN_END = 30
 
 
 # --------------------------- Probe / Scan helpers (reusable) --------------------------- #
