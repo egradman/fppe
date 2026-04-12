@@ -43,11 +43,12 @@ def lekiwi_cameras_config() -> dict[str, CameraConfig]:
 @RobotConfig.register_subclass("lekiwi")
 @dataclass
 class LeKiwiConfig(RobotConfig):
-    left_port: str = "/dev/am_arm_follower_left"  # port to connect to the bus
-    right_port: str = "/dev/am_arm_follower_right"  # port to connect to the bus
+    left_port: str = "/dev/ttyACM0"  # port to connect to the bus
+    right_port: str | None = None  # None = single-bus mode (both arms on left_port)
     disable_torque_on_disconnect: bool = True
     arm_profile: str = "so-arm-5dof"  # "am-arm-6dof" or "so-arm-5dof"
     robot_model: str = "alohamini1"   # "alohamini1" (lead=84 mm/rev) or "alohamini2" (lead=120 mm/rev)
+    left_arm_id_offset: int = 20  # ID offset for left arm in single-bus mode
 
     # `max_relative_target` limits the magnitude of the relative positional target vector for safety purposes.
     # Set this to a positive scalar to have the same value for all motors, or a list that is the same length as

@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gamepad Teleop</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }
+  h1 { margin-bottom: 10px; font-size: 1.4em; }
+  #status { padding: 8px 12px; border-radius: 4px; margin-bottom: 16px; font-weight: bold; }
+  .disconnected { background: #e74c3c; }
+  .connected { background: #27ae60; }
+  .no-gamepad { background: #f39c12; }
+
+  .panel { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 1.1em; margin-bottom: 10px; color: #8be9fd; }
+
+  .stick-container { display: flex; gap: 40px; justify-content: center; margin: 16px 0; }
+  .stick-wrapper { text-align: center; }
+  .stick-wrapper label { display: block; margin-bottom: 6px; font-size: 0.9em; color: #aaa; }
+  .stick { width: 150px; height: 150px; background: #0f3460; border-radius: 50%; position: relative; border: 2px solid #444; }
+  .stick-dot { width: 20px; height: 20px; background: #e94560; border-radius: 50%; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); transition: none; }
+
+  .axes-list, .buttons-list { font-size: 0.85em; line-height: 1.8; }
+  .axis-bar-bg { display: inline-block; width: 120px; height: 12px; background: #0f3460; border-radius: 6px; vertical-align: middle; position: relative; overflow: hidden; }
+  .axis-bar { height: 100%; background: #e94560; position: absolute; transition: none; }
+
+  .buttons-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+  .btn { width: 36px; height: 36px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 0.75em; font-weight: bold; }
+  .btn-off { background: #0f3460; color: #556; }
+  .btn-on { background: #e94560; color: #fff; }
+
+  #ws-url { margin-bottom: 12px; }
+  #ws-url input { background: #0f3460; border: 1px solid #444; color: #eee; padding: 6px 10px; border-radius: 4px; width: 300px; font-family: monospace; }
+  #ws-url button { background: #e94560; border: none; color: #fff; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-family: monospace; margin-left: 6px; }
+
+  #hz { color: #aaa; font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<h1>Gamepad Teleop</h1>
+
+<div id="ws-url">
+  <input id="ws-input" type="text" placeholder="ws://localhost:8765">
+  <button onclick="toggleConnection()">Connect</button>
+</div>
+
+<div id="status" class="disconnected">WebSocket: disconnected</div>
+
+<div class="panel" id="gamepad-panel">
+  <h2 id="gamepad-name">No gamepad detected — press a button on your controller</h2>
+
+  <div class="stick-container">
+    <div class="stick-wrapper">
+      <label>Left Stick</label>
+      <div class="stick" id="stick-left"><div class="stick-dot" id="dot-left"></div></div>
+    </div>
+    <div class="stick-wrapper">
+      <label>Right Stick</label>
+      <div class="stick" id="stick-right"><div class="stick-dot" id="dot-right"></div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Axes</h2>
+    <div class="axes-list" id="axes-list"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Buttons</h2>
+    <div class="buttons-grid" id="buttons-grid"></div>
+  </div>
+
+  <div id="hz"></div>
+</div>
+
+<script>
+const wsInput = document.getElementById('ws-input');
+const statusEl = document.getElementById('status');
+const gamepadName = document.getElementById('gamepad-name');
+const axesList = document.getElementById('axes-list');
+const buttonsGrid = document.getElementById('buttons-grid');
+const dotLeft = document.getElementById('dot-left');
+const dotRight = document.getElementById('dot-right');
+const hzEl = document.getElementById('hz');
+
+// Default to same host, port 8765
+const loc = window.location;
+const defaultWs = `ws://${loc.hostname || 'localhost'}:8765`;
+wsInput.value = defaultWs;
+
+let ws = null;
+let sendCount = 0;
+let lastHzTime = performance.now();
+
+function toggleConnection() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.close();
+    return;
+  }
+  const url = wsInput.value.trim() || defaultWs;
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    statusEl.textContent = 'WebSocket: connected';
+    statusEl.className = 'connected';
+  };
+  ws.onclose = () => {
+    statusEl.textContent = 'WebSocket: disconnected';
+    statusEl.className = 'disconnected';
+    ws = null;
+  };
+  ws.onerror = () => {
+    statusEl.textContent = 'WebSocket: error';
+    statusEl.className = 'disconnected';
+  };
+}
+
+function updateStickDot(dot, x, y) {
+  // x, y in [-1, 1] -> pixel offset within 150px circle
+  // Negate y so stick-up maps to dot-up on screen
+  const r = 55; // max pixel offset
+  const px = x * r;
+  const py = -y * r;
+  dot.style.left = `calc(50% + ${px}px)`;
+  dot.style.top = `calc(50% + ${py}px)`;
+}
+
+function renderAxes(axes) {
+  let html = '';
+  for (let i = 0; i < axes.length; i++) {
+    const v = axes[i];
+    const pct = ((v + 1) / 2) * 100;
+    html += `<div>Axis ${i}: ${v.toFixed(3)} <span class="axis-bar-bg"><span class="axis-bar" style="left:0;width:${pct}%"></span></span></div>`;
+  }
+  axesList.innerHTML = html;
+
+  // Update stick visualizations (standard mapping: 0,1 = left; 2,3 = right)
+  if (axes.length >= 2) updateStickDot(dotLeft, axes[0], axes[1]);
+  if (axes.length >= 4) updateStickDot(dotRight, axes[2], axes[3]);
+}
+
+function renderButtons(buttons) {
+  let html = '';
+  for (let i = 0; i < buttons.length; i++) {
+    const pressed = buttons[i].pressed;
+    html += `<div class="btn ${pressed ? 'btn-on' : 'btn-off'}">${i}</div>`;
+  }
+  buttonsGrid.innerHTML = html;
+}
+
+function pollGamepad() {
+  const gamepads = navigator.getGamepads();
+  let gp = null;
+  for (const g of gamepads) {
+    if (g) { gp = g; break; }
+  }
+
+  if (!gp) {
+    gamepadName.textContent = 'No gamepad detected — press a button on your controller';
+    requestAnimationFrame(pollGamepad);
+    return;
+  }
+
+  gamepadName.textContent = gp.id;
+
+  const axes = Array.from(gp.axes);
+  const buttons = Array.from(gp.buttons);
+
+  renderAxes(axes);
+  renderButtons(buttons);
+
+  // Send over websocket
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      axes: axes,
+      buttons: buttons.map(b => b.pressed),
+    }));
+    sendCount++;
+    const now = performance.now();
+    if (now - lastHzTime > 1000) {
+      const hz = (sendCount / ((now - lastHzTime) / 1000)).toFixed(1);
+      hzEl.textContent = `Sending at ${hz} Hz`;
+      sendCount = 0;
+      lastHzTime = now;
+    }
+  }
+
+  requestAnimationFrame(pollGamepad);
+}
+
+// Auto-connect on load
+window.addEventListener('load', () => {
+  toggleConnection();
+  pollGamepad();
+});
+
+// Detect gamepad connect/disconnect
+window.addEventListener('gamepadconnected', (e) => {
+  gamepadName.textContent = e.gamepad.id;
+  if (!statusEl.className.includes('no-gamepad')) return;
+});
+window.addEventListener('gamepaddisconnected', () => {
+  gamepadName.textContent = 'Gamepad disconnected — reconnect controller';
+});
+</script>
+</body>
+</html>
