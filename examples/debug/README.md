@@ -15,6 +15,8 @@ Once running:
 
 To iterate on the React app locally: `cd examples/debug/web-ui && npm run dev`. Then rebuild and redeploy with `just viser`.
 
+**Note:** `viser_control.py` is launched at boot by the Pi's **labwc/wayland autostart** (kiosk mode) — not by systemd. `just viser` runs `pkill -f viser_control.py` before starting the dev instance so the autostarted one gets out of the way. There is no `systemctl` unit for it.
+
 #### View all motor states
 ```
 python examples/debug/motors.py get_motors_states \

@@ -25,4 +25,5 @@ build-ui:
     cd examples/debug/web-ui && npm run build
 
 viser *args: build-ui sync
-    ssh -t fppe 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate lerobot_alohamini && cd lerobot_alohamini && python examples/debug/viser_control.py {{args}}'
+    ssh fppe 'pkill -f "[v]iser_control.py"; sleep 2'
+    ssh fppe 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate lerobot_alohamini && cd lerobot_alohamini && exec python -u examples/debug/viser_control.py {{args}}'

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const HOST = window.location.hostname;
@@ -20,6 +20,7 @@ function App() {
 
   return (
     <div className="app">
+      <EstopBanner />
       <nav className="tab-bar">
         {tabs.map((tab) => (
           <button
@@ -40,9 +41,7 @@ function App() {
             allow="autoplay; fullscreen; webgl"
           />
         )}
-        {activeTab === "teleop" && (
-          <div className="placeholder">Teleop</div>
-        )}
+        {activeTab === "teleop" && <TeleopPanel />}
         {activeTab === "cam0" && (
           <img
             src={`${API_BASE}/mjpeg/cam0`}
@@ -57,6 +56,213 @@ function App() {
             alt="Camera 1"
           />
         )}
+      </div>
+    </div>
+  );
+}
+
+function EstopBanner() {
+  const [engaged, setEngaged] = useState(false);
+  const [unreachable, setUnreachable] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/state`);
+        const j = await r.json();
+        if (!cancelled) {
+          setEngaged(Boolean(j.estop_engaged));
+          setUnreachable(false);
+        }
+      } catch {
+        if (!cancelled) setUnreachable(true);
+      }
+    };
+    poll();
+    const id = setInterval(poll, 500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  if (unreachable) {
+    return <div className="estop-banner estop-banner-warn">Robot API unreachable</div>;
+  }
+  if (!engaged) return null;
+  return <div className="estop-banner">E-STOP ENGAGED — motors unpowered</div>;
+}
+
+function TeleopPanel() {
+  const [gamepadName, setGamepadName] = useState(
+    "No gamepad detected — press a button on your controller"
+  );
+  const [axes, setAxes] = useState<number[]>([]);
+  const [buttons, setButtons] = useState<boolean[]>([]);
+  const [enabled, setEnabled] = useState(false);
+  const [hz, setHz] = useState("");
+
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
+
+  const lastSendRef = useRef(0);
+  const sendCountRef = useRef(0);
+  const lastHzStampRef = useRef(performance.now());
+
+  useEffect(() => {
+    let rafId = 0;
+    const onConnect = (e: GamepadEvent) => setGamepadName(e.gamepad.id);
+    const onDisconnect = () =>
+      setGamepadName(
+        "Gamepad disconnected — reconnect controller"
+      );
+    window.addEventListener("gamepadconnected", onConnect);
+    window.addEventListener("gamepaddisconnected", onDisconnect);
+
+    const tick = () => {
+      const gps = navigator.getGamepads
+        ? navigator.getGamepads()
+        : ((navigator as unknown as { webkitGetGamepads?: () => Gamepad[] })
+            .webkitGetGamepads?.() ?? []);
+      let gp: Gamepad | null = null;
+      for (let i = 0; i < gps.length; i++) {
+        if (gps[i]) {
+          gp = gps[i];
+          break;
+        }
+      }
+
+      if (gp) {
+        setGamepadName(gp.id);
+        const a = Array.from(gp.axes);
+        const b = gp.buttons.map((btn) => btn.pressed);
+        setAxes(a);
+        setButtons(b);
+
+        const now = performance.now();
+        if (now - lastSendRef.current > 33) {
+          lastSendRef.current = now;
+          fetch(`${API_BASE}/gamepad`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              axes: a,
+              buttons: b,
+              enabled: enabledRef.current,
+            }),
+          }).catch(() => {});
+          sendCountRef.current++;
+          if (now - lastHzStampRef.current > 1000) {
+            const rate = (
+              sendCountRef.current /
+              ((now - lastHzStampRef.current) / 1000)
+            ).toFixed(1);
+            setHz(`Sending at ${rate} Hz`);
+            sendCountRef.current = 0;
+            lastHzStampRef.current = now;
+          }
+        }
+      } else {
+        setGamepadName(
+          "No gamepad detected — press a button on your controller"
+        );
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.removeEventListener("gamepadconnected", onConnect);
+      window.removeEventListener("gamepaddisconnected", onDisconnect);
+      // Tell the backend teleop is off when leaving the tab.
+      fetch(`${API_BASE}/gamepad`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ axes: [], buttons: [], enabled: false }),
+      }).catch(() => {});
+    };
+  }, []);
+
+  const lx = axes[0] ?? 0;
+  const ly = axes[1] ?? 0;
+  const rx = axes[2] ?? 0;
+  const ry = axes[3] ?? 0;
+
+  return (
+    <div className="teleop">
+      <div className={`teleop-status ${enabled ? "on" : "off"}`}>
+        Teleop {enabled ? "ACTIVE" : "disabled"} — {gamepadName}
+      </div>
+
+      <label className="teleop-toggle">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+        />
+        Enable teleop (left stick = strafe/forward, right stick L/R = rotate,
+        buttons 12/13 = lift)
+      </label>
+
+      <div className="sticks">
+        <Stick label="Left Stick" x={lx} y={ly} />
+        <Stick label="Right Stick" x={rx} y={ry} />
+      </div>
+
+      <div className="panel">
+        <h2>Axes</h2>
+        <div className="axes-list">
+          {axes.map((v, i) => (
+            <div key={i} className="axis-row">
+              <span className="axis-label">Axis {i}:</span>
+              <span className="axis-value">{v.toFixed(3)}</span>
+              <span className="axis-bar-bg">
+                <span
+                  className="axis-bar"
+                  style={{ width: `${((v + 1) / 2) * 100}%` }}
+                />
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="panel">
+        <h2>Buttons</h2>
+        <div className="buttons-grid">
+          {buttons.map((pressed, i) => (
+            <div
+              key={i}
+              className={`btn ${pressed ? "btn-on" : "btn-off"}`}
+              title={`Button ${i}`}
+            >
+              {i}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="hz">{hz}</div>
+    </div>
+  );
+}
+
+function Stick({ label, x, y }: { label: string; x: number; y: number }) {
+  const r = 55;
+  const px = x * r;
+  const py = y * r;
+  return (
+    <div className="stick-wrapper">
+      <label>{label}</label>
+      <div className="stick">
+        <div
+          className="stick-dot"
+          style={{
+            left: `calc(50% + ${px}px)`,
+            top: `calc(50% + ${py}px)`,
+          }}
+        />
       </div>
     </div>
   );

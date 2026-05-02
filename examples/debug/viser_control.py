@@ -7,6 +7,7 @@ Provides browser UI with:
   - Home and Middle position buttons
   - Elevator Z Up / Z Down / Z Stop buttons
   - Live 3D URDF visualization
+  - Gamepad teleop (omni base + lift) via companion web UI
 
 HTTP API (on --api-port, default 8091):
   GET  /state                — JSON snapshot of all motor positions and arm lock states
@@ -15,6 +16,13 @@ HTTP API (on --api-port, default 8091):
   POST /lock_arm             — {"side": "left"|"right", "lock": true|false}
   POST /estop                — emergency stop (release all torque)
   POST /lift                 — {"action": "up"|"down"|"stop"}
+  POST /gamepad              — {"axes": [...], "buttons": [bool, ...], "enabled": bool}
+
+The /state response includes "estop_engaged" (bool) read from a Raspberry Pi
+GPIO pin (default GPIO19). The e-stop is inline with motor power, so when
+engaged the Feetech bus is unresponsive — reading the GPIO lets us tell
+"e-stop engaged" (expected; wait it out) apart from "motors broken"
+(unexpected; loose cable, etc).
 
 Usage:
     python viser_control.py                          # defaults
@@ -30,6 +38,7 @@ import argparse
 import json
 import math
 import queue
+import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -50,6 +59,17 @@ from lerobot.robots.alohamini.lekiwi import LeKiwi
 MIDPOINT = 2048
 STEPS_PER_DEG = 4096.0 / 360.0
 LIFT_SPEED_DEGPS = 180.0
+
+# ---- Gamepad teleop (omni base + lift) ----
+WHEEL_NAMES = ("base_left_wheel", "base_back_wheel", "base_right_wheel")
+LIN_SPEED = 0.2             # m/s at full stick
+ANG_SPEED = 80.0            # deg/s at full stick
+WHEEL_RADIUS = 0.05
+BASE_RADIUS = 0.125
+WHEEL_MAX_RAW = 3000
+GAMEPAD_DEADZONE = 0.1
+GAMEPAD_WATCHDOG_S = 0.3    # stop wheels if no gamepad update for this long
+AXIS_LIFT = 7               # D-pad vertical: -1 raises, +1 lowers
 
 HOME_POSITION = {
     "arm_left_shoulder_pan": 2965,
@@ -124,6 +144,23 @@ def raw_to_radians(raw_pos: float) -> float:
     return (raw_pos - MIDPOINT) * (2.0 * math.pi / 4096.0)
 
 
+def body_to_wheel_raw(x_cmd: float, y_cmd: float, theta_cmd_degps: float) -> dict[str, int]:
+    """Map body-frame velocity commands to raw per-wheel velocities for a 3-omni base."""
+    theta_rad = theta_cmd_degps * (math.pi / 180.0)
+    vel = np.array([-x_cmd, -y_cmd, theta_rad])
+    angles = np.radians(np.array([240, 0, 120]) - 90)
+    M = np.array([[np.cos(a), np.sin(a), BASE_RADIUS] for a in angles])
+    v_lin = M.dot(vel)
+    w_rad = v_lin / WHEEL_RADIUS
+    w_degps = w_rad * (180.0 / math.pi)
+    raw_abs = np.abs(w_degps) * STEPS_PER_DEG
+    peak = float(np.max(raw_abs)) if raw_abs.size else 0.0
+    if peak > WHEEL_MAX_RAW and peak > 1e-6:
+        w_degps = w_degps * (WHEEL_MAX_RAW / peak)
+    raw = [degps_to_raw(v) for v in w_degps]
+    return {WHEEL_NAMES[0]: raw[0], WHEEL_NAMES[1]: raw[1], WHEEL_NAMES[2]: raw[2]}
+
+
 
 def _bus_write(bus: FeetechMotorsBus, item: str, name: str, value: int, retries: int = 3):
     """Write with retry to handle transient serial errors on a busy bus."""
@@ -158,6 +195,70 @@ def setup_lift_velocity_mode(bus: FeetechMotorsBus, name: str = "lift_axis"):
     time.sleep(0.02)
 
 
+def setup_wheels_velocity_mode(bus: FeetechMotorsBus, names=WHEEL_NAMES):
+    for name in names:
+        _bus_write(bus, "Torque_Enable", name, 0)
+        time.sleep(0.02)
+        _bus_write(bus, "Operating_Mode", name, OperatingMode.VELOCITY.value)
+        time.sleep(0.02)
+        _bus_write(bus, "Torque_Enable", name, 1)
+        time.sleep(0.02)
+
+
+# ---------------------------------------------------------------------------
+# E-stop GPIO monitor
+# ---------------------------------------------------------------------------
+class EstopMonitor:
+    """Reads an e-stop button wired to a Raspberry Pi GPIO pin.
+
+    The e-stop is inline with motor power. When engaged, the Feetech bus is
+    unresponsive — so the GPIO is the source of truth.
+
+    Wiring on this robot: switch is normally-closed to GND. With internal
+    pull-up enabled, line reads LOW when released and HIGH when engaged
+    (or the wire is broken — fail-safe).
+    """
+
+    def __init__(self, pin: int = 19):
+        self._available = False
+        self._device = None
+        if pin <= 0:
+            print("E-stop monitor disabled (pin <= 0).")
+            return
+        try:
+            from gpiozero import DigitalInputDevice
+
+            self._device = DigitalInputDevice(pin, pull_up=True)
+            self._available = True
+            state = "ENGAGED" if self.engaged else "released"
+            print(f"E-stop monitor: GPIO{pin} (HIGH=engaged); current state: {state}")
+        except Exception as e:
+            print(f"E-stop GPIO unavailable ({e}); proceeding without monitoring.")
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    @property
+    def engaged(self) -> bool:
+        if not self._available:
+            return False
+        return bool(self._device.value)
+
+    def wait_for_release(self, log_interval: float = 5.0):
+        """Block until e-stop is released, logging periodically."""
+        if not self.engaged:
+            return
+        last_log = 0.0
+        while self.engaged:
+            now = time.monotonic()
+            if now - last_log > log_interval:
+                print("E-stop ENGAGED. Waiting for release...")
+                last_log = now
+            time.sleep(0.1)
+        print("E-stop released.")
+
+
 # ---------------------------------------------------------------------------
 # HTTP API
 # ---------------------------------------------------------------------------
@@ -168,18 +269,49 @@ class RobotState:
         self._lock = threading.Lock()
         self._positions: dict[str, int] = {}
         self._arm_locked: dict[str, bool] = {"left": False, "right": False}
+        self._estop_engaged: bool = False
 
-    def update(self, positions: dict[str, int], arm_locked: dict[str, bool]):
+    def update(
+        self,
+        positions: dict[str, int],
+        arm_locked: dict[str, bool],
+        estop_engaged: bool = False,
+    ):
         with self._lock:
             self._positions = dict(positions)
             self._arm_locked = dict(arm_locked)
+            self._estop_engaged = bool(estop_engaged)
 
     def snapshot(self) -> dict:
         with self._lock:
             return {
                 "positions": dict(self._positions),
                 "arm_locked": dict(self._arm_locked),
+                "estop_engaged": self._estop_engaged,
             }
+
+
+class GamepadState:
+    """Latest gamepad state posted by the browser; consumed by the main loop."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._axes: list[float] = []
+        self._buttons: list[bool] = []
+        self._last_update: float = 0.0
+        self._enabled: bool = False
+
+    def update(self, axes: list[float], buttons: list[bool], enabled: bool):
+        with self._lock:
+            self._axes = list(axes)
+            self._buttons = list(buttons)
+            self._enabled = bool(enabled)
+            self._last_update = time.monotonic()
+
+    def snapshot(self) -> tuple[list[float], list[bool], bool, float]:
+        with self._lock:
+            age = time.monotonic() - self._last_update if self._last_update else 1e9
+            return list(self._axes), list(self._buttons), self._enabled, age
 
 
 WEB_DIST = Path(__file__).parent / "web-ui" / "dist"
@@ -189,6 +321,7 @@ class APIHandler(BaseHTTPRequestHandler):
     robot_state: RobotState
     cmd_queue: queue.Queue
     camera_readers: dict  # label -> CameraReader
+    gamepad_state: "GamepadState"
 
     def _json_response(self, code: int, data: dict):
         body = json.dumps(data).encode()
@@ -311,6 +444,14 @@ class APIHandler(BaseHTTPRequestHandler):
             self.cmd_queue.put((cmd,))
             self._json_response(200, {"ok": True})
 
+        elif self.path == "/gamepad":
+            # {"axes": [...], "buttons": [bool, ...], "enabled": bool}
+            axes = [float(v) for v in body.get("axes", [])]
+            buttons = [bool(v) for v in body.get("buttons", [])]
+            enabled = bool(body.get("enabled", False))
+            self.gamepad_state.update(axes, buttons, enabled)
+            self._json_response(200, {"ok": True})
+
         else:
             self.send_error(404)
 
@@ -325,10 +466,17 @@ class APIHandler(BaseHTTPRequestHandler):
         pass  # silence per-request logs
 
 
-def start_api_server(port: int, robot_state: RobotState, cmd_queue: queue.Queue, camera_readers: dict):
+def start_api_server(
+    port: int,
+    robot_state: RobotState,
+    cmd_queue: queue.Queue,
+    camera_readers: dict,
+    gamepad_state: GamepadState,
+):
     APIHandler.robot_state = robot_state
     APIHandler.cmd_queue = cmd_queue
     APIHandler.camera_readers = camera_readers
+    APIHandler.gamepad_state = gamepad_state
     httpd = ThreadingHTTPServer(("0.0.0.0", port), APIHandler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -348,7 +496,21 @@ def main():
     parser.add_argument("--cam1", default="/dev/video2", help="Second camera device")
     parser.add_argument("--cam-width", type=int, default=640)
     parser.add_argument("--cam-height", type=int, default=480)
+    parser.add_argument(
+        "--estop-gpio",
+        type=int,
+        default=19,
+        help="Raspberry Pi GPIO pin for e-stop input (HIGH=engaged, with pull-up). 0 disables.",
+    )
     args = parser.parse_args()
+
+    # Ensure `pkill` (SIGTERM) runs the finally: block so cameras and motors
+    # release cleanly. Without this, SIGTERM bypasses cleanup and leaves the
+    # UVC driver in a state that makes the next process hang on open.
+    def _on_sigterm(signum, _frame):
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     # ---- Connect motors via LeKiwi config ----
     config = LeKiwiConfig()
@@ -364,13 +526,45 @@ def main():
     print(f"Connected. Left arm:  {left_motors}")
     print(f"           Right arm: {right_motors}")
 
-    # Read initial positions & configure servos
-    initial_pos = bus.sync_read("Present_Position", all_arm_motors, normalize=False)
-    print(f"Initial positions: {initial_pos}")
+    # ---- E-stop monitor ----
+    estop = EstopMonitor(pin=args.estop_gpio)
 
-    setup_arm_position_mode(bus, all_arm_motors)
-    setup_lift_velocity_mode(bus)
-    bus.sync_write("Goal_Position", initial_pos, normalize=False)
+    # Read initial positions & configure servos. If the e-stop is engaged the
+    # bus will be unresponsive; wait it out instead of crashing the autostart.
+    def _setup_motors_once():
+        ipos = bus.sync_read("Present_Position", all_arm_motors, normalize=False)
+        setup_arm_position_mode(bus, all_arm_motors)
+        setup_lift_velocity_mode(bus)
+        wr = True
+        wr_err: Exception | None = None
+        try:
+            setup_wheels_velocity_mode(bus)
+        except Exception as e:
+            wr = False
+            wr_err = e
+        bus.sync_write("Goal_Position", ipos, normalize=False)
+        return ipos, wr, wr_err
+
+    last_log = 0.0
+    while True:
+        estop.wait_for_release()
+        if estop.engaged:
+            continue  # re-engaged before we got a chance; loop back
+        try:
+            initial_pos, wheels_ready, wheels_err = _setup_motors_once()
+            break
+        except Exception as e:
+            now = time.monotonic()
+            if now - last_log > 5.0:
+                print(f"Motor setup failed ({e}). Retrying — check bus cable / motor power.")
+                last_log = now
+            time.sleep(1.0)
+
+    print(f"Initial positions: {initial_pos}")
+    if wheels_ready:
+        print(f"Wheels ready: {WHEEL_NAMES}")
+    else:
+        print(f"Wheels not available ({wheels_err}); gamepad teleop will control lift only.")
 
     # ---- Cameras (threaded readers to avoid buffering lag) ----
     class CameraReader:
@@ -399,9 +593,17 @@ def main():
                 return self._frame
 
         def release(self):
+            # Order matters: releasing the capture first cancels any in-flight
+            # V4L2 dqbuf so the reader thread's cap.read() returns promptly.
+            # Otherwise the thread stays blocked in the kernel driver and
+            # leaves UVC streaming state half-configured, which makes the
+            # next process hang opening the device.
             self._running = False
+            try:
+                self.cap.release()
+            except Exception:
+                pass
             self._thread.join(timeout=2)
-            self.cap.release()
 
     cameras: dict[str, CameraReader] = {}
     for label, dev in [("cam0", args.cam0), ("cam1", args.cam1)]:
@@ -436,10 +638,11 @@ def main():
     cmd_q: queue.Queue = queue.Queue()
     motor_sliders: dict[str, viser.GuiInputHandle] = {}
 
-    # ---- HTTP API ----
+    # ---- HTTP API state (server started after GUI is built so the kiosk
+    # autostart's wait on port 8091 also implies the viser GUI is ready) ----
     robot_state = RobotState()
     robot_state.update(initial_pos, arm_locked)
-    start_api_server(args.api_port, robot_state, cmd_q, cameras)
+    gamepad_state = GamepadState()
 
     # ---- Build GUI (tabbed sidebar) ----
     tabs = server.gui.add_tab_group()
@@ -510,6 +713,10 @@ def main():
         btn_z_down = server.gui.add_button("Z Down", color="orange")
         btn_z_stop = server.gui.add_button("Z Stop", color="gray")
 
+    # ---- HTTP API (started after the GUI build so port 8091 only opens
+    # once viser's tab tree is ready; the kiosk autostart waits on 8091) ----
+    start_api_server(args.api_port, robot_state, cmd_q, cameras, gamepad_state)
+
     @btn_z_up.on_click
     def _(_):
         cmd_q.put(("lift_up",))
@@ -536,6 +743,15 @@ def main():
 
     # ---- Process command queue (runs in main thread only) ----
     def process_commands():
+        if estop.engaged:
+            # Bus is unresponsive while e-stop is engaged. Drop pending commands
+            # rather than letting them queue up to fire on release.
+            while not cmd_q.empty():
+                try:
+                    cmd_q.get_nowait()
+                except queue.Empty:
+                    break
+            return
         while not cmd_q.empty():
             try:
                 cmd = cmd_q.get_nowait()
@@ -607,11 +823,94 @@ def main():
             elif kind == "lift_stop":
                 _bus_write(bus, "Goal_Velocity", "lift_axis", 0)
 
+    # ---- Gamepad → wheels + lift ----
+    teleop_active = {"on": False}  # tracks whether wheels are currently driven by gamepad
+
+    def apply_deadzone(vals: list[float]) -> list[float]:
+        return [0.0 if abs(v) < GAMEPAD_DEADZONE else v for v in vals]
+
+    def process_gamepad():
+        if estop.engaged:
+            teleop_active["on"] = False
+            return
+        axes, buttons, enabled, age = gamepad_state.snapshot()
+        fresh = enabled and age < GAMEPAD_WATCHDOG_S
+
+        if fresh:
+            axes = apply_deadzone(axes)
+            if len(axes) >= 3:
+                x_cmd = -axes[1] * LIN_SPEED
+                y_cmd = -axes[0] * LIN_SPEED
+                th_cmd = -axes[2] * ANG_SPEED
+            else:
+                x_cmd = y_cmd = th_cmd = 0.0
+
+            if wheels_ready:
+                cmds = body_to_wheel_raw(x_cmd, y_cmd, th_cmd)
+                for name, raw in cmds.items():
+                    try:
+                        _bus_write(bus, "Goal_Velocity", name, raw)
+                    except Exception as e:
+                        print(f"Wheel write failed ({name}): {e}")
+
+            lift_axis_val = axes[AXIS_LIFT] if len(axes) > AXIS_LIFT else 0.0
+            lift_raw = degps_to_raw(lift_axis_val * LIFT_SPEED_DEGPS)
+            try:
+                _bus_write(bus, "Goal_Velocity", "lift_axis", lift_raw)
+            except Exception as e:
+                print(f"Lift write failed: {e}")
+
+            teleop_active["on"] = True
+        elif teleop_active["on"]:
+            # Edge: just went stale → stop wheels + lift once.
+            if wheels_ready:
+                for name in WHEEL_NAMES:
+                    try:
+                        _bus_write(bus, "Goal_Velocity", name, 0)
+                    except Exception:
+                        pass
+            try:
+                _bus_write(bus, "Goal_Velocity", "lift_axis", 0)
+            except Exception:
+                pass
+            teleop_active["on"] = False
+
     # ---- Main loop ----
     print("Control loop running. Press Ctrl-C to quit.")
+    estop_was_engaged = estop.engaged
     try:
         while True:
             process_commands()
+            process_gamepad()
+
+            if estop.engaged:
+                if not estop_was_engaged:
+                    print("E-stop ENGAGED. Servos unpowered; arms marked unlocked.")
+                    arm_locked["left"] = False
+                    arm_locked["right"] = False
+                    estop_was_engaged = True
+                robot_state.update({}, arm_locked, estop_engaged=True)
+                time.sleep(0.1)
+                continue
+
+            if estop_was_engaged:
+                # Just released — let servos finish powering up, then restore
+                # velocity-mode setup for lift/wheels. Arms stay unlocked
+                # (user must explicitly re-lock from the UI).
+                print("E-stop RELEASED. Restoring lift/wheels (arms remain unlocked).")
+                time.sleep(0.5)
+                try:
+                    setup_lift_velocity_mode(bus)
+                    if wheels_ready:
+                        try:
+                            setup_wheels_velocity_mode(bus)
+                        except Exception as e:
+                            print(f"Wheel restore failed ({e})")
+                    estop_was_engaged = False
+                except Exception as e:
+                    print(f"Lift restore failed ({e}); will retry.")
+                    time.sleep(0.5)
+                    continue
 
             # Read arm positions
             try:
@@ -633,7 +932,7 @@ def main():
             update_urdf(positions)
 
             # Update HTTP API state
-            robot_state.update(positions, arm_locked)
+            robot_state.update(positions, arm_locked, estop_engaged=False)
 
             time.sleep(0.05)  # ~20 Hz
 
@@ -644,6 +943,12 @@ def main():
             _bus_write(bus, "Goal_Velocity", "lift_axis", 0)
         except Exception:
             pass
+        if wheels_ready:
+            for name in WHEEL_NAMES:
+                try:
+                    _bus_write(bus, "Goal_Velocity", name, 0)
+                except Exception:
+                    pass
         for name in all_arm_motors:
             try:
                 _bus_write(bus, "Torque_Enable", name, 0)
