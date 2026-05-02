@@ -1,5 +1,5 @@
 sync:
-    rsync -avz --delete --exclude='__pycache__' --exclude='node_modules' . fppe:lerobot_alohamini/
+    rsync -avz --delete --exclude='__pycache__' --exclude='node_modules' --exclude='.venv' . fppe:lerobot_alohamini/
     ssh fppe 'ln -sfn ~/lerobot_alohamini ~/fppe'
 
 remote *args: sync
@@ -27,3 +27,11 @@ build-ui:
 viser *args: build-ui sync
     ssh fppe 'pkill -f "[v]iser_control.py"; sleep 2'
     ssh fppe 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate lerobot_alohamini && cd lerobot_alohamini && exec python -u examples/debug/viser_control.py {{args}}'
+
+# Local (skynet) — calibrate the two SO-101 leader arms once.
+leader-calibrate *args:
+    cd leader_teleop && uv run leader-calibrate {{args}}
+
+# Local (skynet) — stream leader joint angles to fppe over UDP.
+leader-teleop *args:
+    cd leader_teleop && uv run leader-teleop {{args}}

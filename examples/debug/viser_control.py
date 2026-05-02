@@ -17,6 +17,7 @@ HTTP API (on --api-port, default 8091):
   POST /estop                — emergency stop (release all torque)
   POST /lift                 — {"action": "up"|"down"|"stop"}
   POST /gamepad              — {"axes": [...], "buttons": [bool, ...], "enabled": bool}
+  POST /teleop_mode          — {"mode": "local"|"remote"} — see TeleopMode
 
 The /state response includes "estop_engaged" (bool) read from a Raspberry Pi
 GPIO pin (default GPIO19). The e-stop is inline with motor power, so when
@@ -39,6 +40,8 @@ import json
 import math
 import queue
 import signal
+import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -49,9 +52,18 @@ import cv2
 import numpy as np
 import viser
 
+# Make `leader_teleop` (a sibling uv project under the repo root) importable
+# without installing it: it has its own .venv, but its `wire.py` only depends
+# on pydantic (which lerobot's env already provides), so we just put its src
+# layout on sys.path.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "leader_teleop" / "src"))
+
 from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.robots.alohamini.config_lekiwi import LeKiwiConfig
 from lerobot.robots.alohamini.lekiwi import LeKiwi
+
+from leader_teleop import wire as leader_wire
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -162,16 +174,47 @@ def body_to_wheel_raw(x_cmd: float, y_cmd: float, theta_cmd_degps: float) -> dic
 
 
 
+# Module-level lock around the Feetech bus. Acquired by _bus_write internally
+# and explicitly wrapped around any direct bus.sync_read/sync_write call so the
+# leader-UDP listener thread can safely write goals without racing the main
+# loop. Re-entrant so a `with _BUS_LOCK` block can call helpers that also lock.
+_BUS_LOCK = threading.RLock()
+
+
 def _bus_write(bus: FeetechMotorsBus, item: str, name: str, value: int, retries: int = 3):
     """Write with retry to handle transient serial errors on a busy bus."""
     for attempt in range(retries):
         try:
-            bus.write(item, name, value, normalize=False)
+            with _BUS_LOCK:
+                bus.write(item, name, value, normalize=False)
             return
         except Exception:
             if attempt == retries - 1:
                 raise
             time.sleep(0.05)
+
+
+def _deg_to_tick(bus: FeetechMotorsBus, motor_name: str, deg: float) -> int:
+    """Convert degrees-about-home to a raw tick.
+
+    The follower's calibration writes Homing_Offset such that Present_Position
+    reads (max_res // 2) at the user-defined home pose (lerobot's
+    set_half_turn_homings). So tick 2047 IS the follower's home — anchor
+    deg→tick on that, not on (range_min+range_max)/2 (which is only home if the
+    joint's ROM is symmetric, and frequently isn't).
+    """
+    motor = bus.motors[motor_name]
+    max_res = bus.model_resolution_table[motor.model] - 1   # 4095 for sts3215
+    home = max_res // 2                                     # 2047
+    return int(deg * max_res / 360 + home)
+
+
+def _pct_to_tick(bus: FeetechMotorsBus, motor_name: str, pct: float) -> int:
+    """Convert a 0..100 percent value to a raw tick (gripper). Mirrors
+    FeetechMotorsBus._unnormalize for MotorNormMode.RANGE_0_100."""
+    cal = bus.calibration[motor_name]
+    pct = max(0.0, min(100.0, pct))
+    return int((pct / 100.0) * (cal.range_max - cal.range_min) + cal.range_min)
 
 
 def setup_arm_position_mode(bus: FeetechMotorsBus, names: list[str], accel: int = 20):
@@ -291,6 +334,36 @@ class RobotState:
             }
 
 
+class TeleopMode:
+    """Selects which input source is allowed to drive the robot.
+
+    'local'  — gamepad controls wheels + lift; remote UDP packets are dropped.
+    'remote' — UDP packets from skynet drive the arm joints; gamepad inputs
+               are ignored (and any wheel/lift motion from the gamepad is
+               stopped on the mode transition).
+
+    The two input paths target different actuators (wheels/lift vs arms), but
+    we expose them as mutually-exclusive modes so the operator always knows
+    which controller has authority.
+    """
+
+    def __init__(self, initial: str = "local"):
+        self._lock = threading.Lock()
+        self._mode = initial
+
+    @property
+    def mode(self) -> str:
+        with self._lock:
+            return self._mode
+
+    def set(self, mode: str) -> bool:
+        if mode not in ("local", "remote"):
+            return False
+        with self._lock:
+            self._mode = mode
+        return True
+
+
 class GamepadState:
     """Latest gamepad state posted by the browser; consumed by the main loop."""
 
@@ -322,6 +395,7 @@ class APIHandler(BaseHTTPRequestHandler):
     cmd_queue: queue.Queue
     camera_readers: dict  # label -> CameraReader
     gamepad_state: "GamepadState"
+    teleop_mode: "TeleopMode"
 
     def _json_response(self, code: int, data: dict):
         body = json.dumps(data).encode()
@@ -386,7 +460,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/state":
-            self._json_response(200, self.robot_state.snapshot())
+            snap = self.robot_state.snapshot()
+            snap["teleop_mode"] = self.teleop_mode.mode
+            self._json_response(200, snap)
         elif self.path.startswith("/mjpeg/"):
             label = self.path.split("/mjpeg/", 1)[1]
             self._stream_mjpeg(label)
@@ -452,6 +528,14 @@ class APIHandler(BaseHTTPRequestHandler):
             self.gamepad_state.update(axes, buttons, enabled)
             self._json_response(200, {"ok": True})
 
+        elif self.path == "/teleop_mode":
+            # {"mode": "local"|"remote"}
+            mode = body.get("mode")
+            if not self.teleop_mode.set(mode):
+                self._json_response(400, {"error": "mode must be 'local' or 'remote'"})
+                return
+            self._json_response(200, {"ok": True, "mode": self.teleop_mode.mode})
+
         else:
             self.send_error(404)
 
@@ -472,16 +556,100 @@ def start_api_server(
     cmd_queue: queue.Queue,
     camera_readers: dict,
     gamepad_state: GamepadState,
+    teleop_mode: TeleopMode,
 ):
     APIHandler.robot_state = robot_state
     APIHandler.cmd_queue = cmd_queue
     APIHandler.camera_readers = camera_readers
     APIHandler.gamepad_state = gamepad_state
+    APIHandler.teleop_mode = teleop_mode
     httpd = ThreadingHTTPServer(("0.0.0.0", port), APIHandler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     print(f"HTTP API: http://0.0.0.0:{port}/state")
     return httpd
+
+
+# ---------------------------------------------------------------------------
+# Leader UDP listener: receives joint angles streamed from skynet at ~100 Hz
+# and writes them straight to the bus from this thread (under bus_lock) so
+# packets don't sit on the cmd_queue waiting for the main loop's next tick.
+# Out-of-order/stale packets are dropped.
+# ---------------------------------------------------------------------------
+def start_leader_udp_listener(
+    port: int,
+    bus: FeetechMotorsBus,
+    arm_locked: dict,
+    available_arm_motors: set[str],
+    teleop_mode: TeleopMode,
+    estop: EstopMonitor,
+) -> tuple[socket.socket, threading.Thread]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", port))
+    sock.settimeout(0.5)
+
+    state = {"last_seq": None, "last_warn": 0.0, "pkt_count": 0, "drop_count": 0}
+
+    def _run():
+        while True:
+            try:
+                data, _addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return  # socket closed
+
+            try:
+                pkt = leader_wire.decode(data)
+            except Exception as e:
+                now = time.monotonic()
+                if now - state["last_warn"] > 1.0:
+                    print(f"Leader UDP: decode error: {e}")
+                    state["last_warn"] = now
+                continue
+
+            if state["last_seq"] is not None and leader_wire.seq_lt(pkt.seq, state["last_seq"]):
+                state["drop_count"] += 1
+                continue
+            state["last_seq"] = pkt.seq
+            state["pkt_count"] += 1
+
+            if teleop_mode.mode != "remote" or estop.engaged:
+                continue
+
+            goals: dict[str, int] = {}
+            for side, arm in (("left", pkt.left), ("right", pkt.right)):
+                if arm is None or not arm_locked.get(side):
+                    continue
+                for body_joint in leader_wire.BODY_JOINT_NAMES:
+                    name = f"arm_{side}_{body_joint}"
+                    if name in available_arm_motors:
+                        deg = getattr(arm, body_joint)
+                        goals[name] = _deg_to_tick(bus, name, deg)
+                gripper = f"arm_{side}_{leader_wire.GRIPPER_NAME}"
+                if gripper in available_arm_motors:
+                    goals[gripper] = _pct_to_tick(bus, gripper, arm.gripper)
+
+            if not goals:
+                continue
+
+            # Direct write under the shared bus lock — typical wait is <2 ms
+            # (waiting for the main loop's current sync_read or sync_write to
+            # finish), vs. up to ~25 ms if we'd queued instead.
+            try:
+                with _BUS_LOCK:
+                    bus.sync_write("Goal_Position", goals, normalize=False)
+            except Exception as e:
+                now = time.monotonic()
+                if now - state["last_warn"] > 1.0:
+                    print(f"Leader UDP: sync_write failed: {e}")
+                    state["last_warn"] = now
+
+    t = threading.Thread(target=_run, daemon=True, name="leader-udp")
+    t.start()
+    print(f"Leader UDP listener: 0.0.0.0:{port}")
+    return sock, t
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +669,12 @@ def main():
         type=int,
         default=19,
         help="Raspberry Pi GPIO pin for e-stop input (HIGH=engaged, with pull-up). 0 disables.",
+    )
+    parser.add_argument(
+        "--leader-udp-port",
+        type=int,
+        default=leader_wire.DEFAULT_PORT,
+        help="UDP port to receive leader-arm joint-angle packets from skynet. 0 disables.",
     )
     args = parser.parse_args()
 
@@ -532,7 +706,8 @@ def main():
     # Read initial positions & configure servos. If the e-stop is engaged the
     # bus will be unresponsive; wait it out instead of crashing the autostart.
     def _setup_motors_once():
-        ipos = bus.sync_read("Present_Position", all_arm_motors, normalize=False)
+        with _BUS_LOCK:
+            ipos = bus.sync_read("Present_Position", all_arm_motors, normalize=False)
         setup_arm_position_mode(bus, all_arm_motors)
         setup_lift_velocity_mode(bus)
         wr = True
@@ -542,7 +717,8 @@ def main():
         except Exception as e:
             wr = False
             wr_err = e
-        bus.sync_write("Goal_Position", ipos, normalize=False)
+        with _BUS_LOCK:
+            bus.sync_write("Goal_Position", ipos, normalize=False)
         return ipos, wr, wr_err
 
     last_log = 0.0
@@ -643,6 +819,7 @@ def main():
     robot_state = RobotState()
     robot_state.update(initial_pos, arm_locked)
     gamepad_state = GamepadState()
+    teleop_mode = TeleopMode(initial="local")
 
     # ---- Build GUI (tabbed sidebar) ----
     tabs = server.gui.add_tab_group()
@@ -715,7 +892,18 @@ def main():
 
     # ---- HTTP API (started after the GUI build so port 8091 only opens
     # once viser's tab tree is ready; the kiosk autostart waits on 8091) ----
-    start_api_server(args.api_port, robot_state, cmd_q, cameras, gamepad_state)
+    start_api_server(args.api_port, robot_state, cmd_q, cameras, gamepad_state, teleop_mode)
+
+    # ---- Leader UDP listener (skynet -> fppe joint-angle stream) ----
+    if args.leader_udp_port > 0:
+        start_leader_udp_listener(
+            args.leader_udp_port,
+            bus,
+            arm_locked=arm_locked,
+            available_arm_motors=set(all_arm_motors),
+            teleop_mode=teleop_mode,
+            estop=estop,
+        )
 
     @btn_z_up.on_click
     def _(_):
@@ -778,7 +966,8 @@ def main():
                     if not arm_locked[side]:
                         setup_arm_position_mode(bus, motors)
                         arm_locked[side] = True
-                bus.sync_write("Goal_Position", goals, normalize=False)
+                with _BUS_LOCK:
+                    bus.sync_write("Goal_Position", goals, normalize=False)
                 guard["updating"] = True
                 for name, slider in motor_sliders.items():
                     slider.value = goals[name]
@@ -796,9 +985,11 @@ def main():
             elif kind == "lock_arm":
                 _, side = cmd
                 motors = left_motors if side == "left" else right_motors
-                cur = bus.sync_read("Present_Position", motors, normalize=False)
+                with _BUS_LOCK:
+                    cur = bus.sync_read("Present_Position", motors, normalize=False)
                 setup_arm_position_mode(bus, motors)
-                bus.sync_write("Goal_Position", cur, normalize=False)
+                with _BUS_LOCK:
+                    bus.sync_write("Goal_Position", cur, normalize=False)
                 arm_locked[side] = True
                 guard["updating"] = True
                 for name in motors:
@@ -829,9 +1020,29 @@ def main():
     def apply_deadzone(vals: list[float]) -> list[float]:
         return [0.0 if abs(v) < GAMEPAD_DEADZONE else v for v in vals]
 
+    def _stop_wheels_and_lift():
+        if wheels_ready:
+            for name in WHEEL_NAMES:
+                try:
+                    _bus_write(bus, "Goal_Velocity", name, 0)
+                except Exception:
+                    pass
+        try:
+            _bus_write(bus, "Goal_Velocity", "lift_axis", 0)
+        except Exception:
+            pass
+
     def process_gamepad():
         if estop.engaged:
             teleop_active["on"] = False
+            return
+        if teleop_mode.mode != "local":
+            # Operator switched to remote teleop — stop any motion the
+            # gamepad was driving so the base/lift coast to a halt instead of
+            # latching their last commanded velocity.
+            if teleop_active["on"]:
+                _stop_wheels_and_lift()
+                teleop_active["on"] = False
             return
         axes, buttons, enabled, age = gamepad_state.snapshot()
         fresh = enabled and age < GAMEPAD_WATCHDOG_S
@@ -863,16 +1074,7 @@ def main():
             teleop_active["on"] = True
         elif teleop_active["on"]:
             # Edge: just went stale → stop wheels + lift once.
-            if wheels_ready:
-                for name in WHEEL_NAMES:
-                    try:
-                        _bus_write(bus, "Goal_Velocity", name, 0)
-                    except Exception:
-                        pass
-            try:
-                _bus_write(bus, "Goal_Velocity", "lift_axis", 0)
-            except Exception:
-                pass
+            _stop_wheels_and_lift()
             teleop_active["on"] = False
 
     # ---- Main loop ----
@@ -914,7 +1116,8 @@ def main():
 
             # Read arm positions
             try:
-                positions = bus.sync_read("Present_Position", all_arm_motors, normalize=False)
+                with _BUS_LOCK:
+                    positions = bus.sync_read("Present_Position", all_arm_motors, normalize=False)
             except Exception as e:
                 print(f"Read error: {e}")
                 time.sleep(0.1)
@@ -934,7 +1137,10 @@ def main():
             # Update HTTP API state
             robot_state.update(positions, arm_locked, estop_engaged=False)
 
-            time.sleep(0.05)  # ~20 Hz
+            # 5 ms target; the loop's actual floor is sync_read + sync_write
+            # (~10–15 ms), landing the real tick around 50–70 Hz. The shorter
+            # sleep cuts worst-case queue-dwell latency for leader UDP packets.
+            time.sleep(0.005)
 
     except KeyboardInterrupt:
         print("\nShutting down...")

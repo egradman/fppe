@@ -6,14 +6,15 @@ const API_PORT = 8091;
 const VISER_PORT = 8090;
 const API_BASE = `http://${HOST}:${API_PORT}`;
 
-type Tab = "controls" | "teleop" | "cam0" | "cam1";
+type Tab = "controls" | "local-teleop" | "remote-teleop" | "cam0" | "cam1";
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("controls");
 
   const tabs: { id: Tab; label: string }[] = [
     { id: "controls", label: "Controls" },
-    { id: "teleop", label: "Teleop" },
+    { id: "local-teleop", label: "Local Teleop" },
+    { id: "remote-teleop", label: "Remote Teleop" },
     { id: "cam0", label: "Camera 0" },
     { id: "cam1", label: "Camera 1" },
   ];
@@ -41,7 +42,8 @@ function App() {
             allow="autoplay; fullscreen; webgl"
           />
         )}
-        {activeTab === "teleop" && <TeleopPanel />}
+        {activeTab === "local-teleop" && <LocalTeleopPanel />}
+        {activeTab === "remote-teleop" && <RemoteTeleopPanel />}
         {activeTab === "cam0" && (
           <img
             src={`${API_BASE}/mjpeg/cam0`}
@@ -94,7 +96,7 @@ function EstopBanner() {
   return <div className="estop-banner">E-STOP ENGAGED — motors unpowered</div>;
 }
 
-function TeleopPanel() {
+function LocalTeleopPanel() {
   const [gamepadName, setGamepadName] = useState(
     "No gamepad detected — press a button on your controller"
   );
@@ -109,6 +111,17 @@ function TeleopPanel() {
   const lastSendRef = useRef(0);
   const sendCountRef = useRef(0);
   const lastHzStampRef = useRef(performance.now());
+
+  // Tell the backend the operator selected local teleop. The backend
+  // gates the gamepad/UDP paths on this so only one input source has
+  // authority at a time.
+  useEffect(() => {
+    fetch(`${API_BASE}/teleop_mode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "local" }),
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     let rafId = 0;
@@ -244,6 +257,55 @@ function TeleopPanel() {
       </div>
 
       <div className="hz">{hz}</div>
+    </div>
+  );
+}
+
+function RemoteTeleopPanel() {
+  const [mode, setMode] = useState<string>("");
+
+  // Switch the backend to remote teleop while this tab is mounted.
+  useEffect(() => {
+    fetch(`${API_BASE}/teleop_mode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "remote" }),
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/state`);
+        const j = await r.json();
+        if (!cancelled) setMode(String(j.teleop_mode ?? ""));
+      } catch {
+        // ignore
+      }
+    };
+    poll();
+    const id = setInterval(poll, 500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const active = mode === "remote";
+
+  return (
+    <div className="remote-teleop">
+      <div className={`teleop-status ${active ? "on" : "off"}`}>
+        Remote teleop {active ? "ACTIVE" : "inactive"} — UDP stream from skynet
+        drives the arms
+      </div>
+      <iframe
+        src={`http://${HOST}:${VISER_PORT}`}
+        className="urdf-frame"
+        title="Viser URDF"
+        allow="autoplay; fullscreen; webgl"
+      />
     </div>
   );
 }
