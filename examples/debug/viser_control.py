@@ -335,16 +335,18 @@ class RobotState:
 
 
 class TeleopMode:
-    """Selects which input source is allowed to drive the robot.
+    """Selects which input sources are allowed to drive the robot.
 
     'local'  — gamepad controls wheels + lift; remote UDP packets are dropped.
-    'remote' — UDP packets from skynet drive the arm joints; gamepad inputs
-               are ignored (and any wheel/lift motion from the gamepad is
-               stopped on the mode transition).
+    'remote' — UDP packets from skynet drive the arm joints AND the gamepad
+               continues to drive wheels + lift (the two paths target disjoint
+               actuators). Useful for one operator driving with leader arms in
+               their hands while a second operator drives the base, or just to
+               keep the base usable during arm teleop.
 
-    The two input paths target different actuators (wheels/lift vs arms), but
-    we expose them as mutually-exclusive modes so the operator always knows
-    which controller has authority.
+    'off' would be the only state where no input source has authority; we
+    don't currently model that explicitly — leaving the tab stops the gamepad
+    pump on the client side, and the wheel watchdog coasts the base to a halt.
     """
 
     def __init__(self, initial: str = "local"):
@@ -1062,10 +1064,8 @@ def main():
         if estop.engaged:
             teleop_active["on"] = False
             return
-        if teleop_mode.mode != "local":
-            # Operator switched to remote teleop — stop any motion the
-            # gamepad was driving so the base/lift coast to a halt instead of
-            # latching their last commanded velocity.
+        if teleop_mode.mode not in ("local", "remote"):
+            # No input authority at all — coast the base/lift down once.
             if teleop_active["on"]:
                 _stop_wheels_and_lift()
                 teleop_active["on"] = False

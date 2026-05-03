@@ -96,40 +96,30 @@ function EstopBanner() {
   return <div className="estop-banner">E-STOP ENGAGED — motors unpowered</div>;
 }
 
-function LocalTeleopPanel() {
+// Polls the browser Gamepad API at frame rate, mirrors axes/buttons into
+// state, and pushes them to /gamepad at ~30 Hz. The `enabled` flag is sent
+// through to the backend (the watchdog coasts wheels/lift to halt when off).
+// Returns the live state for any visualizers that want to render it.
+function useGamepadPump(enabled: boolean) {
   const [gamepadName, setGamepadName] = useState(
     "No gamepad detected — press a button on your controller"
   );
   const [axes, setAxes] = useState<number[]>([]);
   const [buttons, setButtons] = useState<boolean[]>([]);
-  const [enabled, setEnabled] = useState(false);
   const [hz, setHz] = useState("");
 
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
 
-  const lastSendRef = useRef(0);
-  const sendCountRef = useRef(0);
-  const lastHzStampRef = useRef(performance.now());
-
-  // Tell the backend the operator selected local teleop. The backend
-  // gates the gamepad/UDP paths on this so only one input source has
-  // authority at a time.
-  useEffect(() => {
-    fetch(`${API_BASE}/teleop_mode`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: "local" }),
-    }).catch(() => {});
-  }, []);
-
   useEffect(() => {
     let rafId = 0;
+    let lastSend = 0;
+    let sendCount = 0;
+    let lastHzStamp = performance.now();
+
     const onConnect = (e: GamepadEvent) => setGamepadName(e.gamepad.id);
     const onDisconnect = () =>
-      setGamepadName(
-        "Gamepad disconnected — reconnect controller"
-      );
+      setGamepadName("Gamepad disconnected — reconnect controller");
     window.addEventListener("gamepadconnected", onConnect);
     window.addEventListener("gamepaddisconnected", onDisconnect);
 
@@ -154,8 +144,8 @@ function LocalTeleopPanel() {
         setButtons(b);
 
         const now = performance.now();
-        if (now - lastSendRef.current > 33) {
-          lastSendRef.current = now;
+        if (now - lastSend > 33) {
+          lastSend = now;
           fetch(`${API_BASE}/gamepad`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -165,15 +155,12 @@ function LocalTeleopPanel() {
               enabled: enabledRef.current,
             }),
           }).catch(() => {});
-          sendCountRef.current++;
-          if (now - lastHzStampRef.current > 1000) {
-            const rate = (
-              sendCountRef.current /
-              ((now - lastHzStampRef.current) / 1000)
-            ).toFixed(1);
+          sendCount++;
+          if (now - lastHzStamp > 1000) {
+            const rate = (sendCount / ((now - lastHzStamp) / 1000)).toFixed(1);
             setHz(`Sending at ${rate} Hz`);
-            sendCountRef.current = 0;
-            lastHzStampRef.current = now;
+            sendCount = 0;
+            lastHzStamp = now;
           }
         }
       } else {
@@ -184,17 +171,37 @@ function LocalTeleopPanel() {
       rafId = requestAnimationFrame(tick);
     };
     rafId = requestAnimationFrame(tick);
+
     return () => {
       cancelAnimationFrame(rafId);
       window.removeEventListener("gamepadconnected", onConnect);
       window.removeEventListener("gamepaddisconnected", onDisconnect);
-      // Tell the backend teleop is off when leaving the tab.
+      // Tell the backend the gamepad is off when this hook unmounts so the
+      // wheel/lift watchdog coasts everything to a halt promptly.
       fetch(`${API_BASE}/gamepad`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ axes: [], buttons: [], enabled: false }),
       }).catch(() => {});
     };
+  }, []);
+
+  return { gamepadName, axes, buttons, hz };
+}
+
+function LocalTeleopPanel() {
+  const [enabled, setEnabled] = useState(false);
+  const { gamepadName, axes, buttons, hz } = useGamepadPump(enabled);
+
+  // Tell the backend the operator selected local teleop. The backend
+  // gates the gamepad/UDP paths on this so only one input source has
+  // authority at a time.
+  useEffect(() => {
+    fetch(`${API_BASE}/teleop_mode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "local" }),
+    }).catch(() => {});
   }, []);
 
   const lx = axes[0] ?? 0;
@@ -263,6 +270,8 @@ function LocalTeleopPanel() {
 
 function RemoteTeleopPanel() {
   const [mode, setMode] = useState<string>("");
+  const [gamepadEnabled, setGamepadEnabled] = useState(false);
+  const { gamepadName } = useGamepadPump(gamepadEnabled);
 
   // Switch the backend to remote teleop while this tab is mounted.
   useEffect(() => {
@@ -329,6 +338,17 @@ function RemoteTeleopPanel() {
           <button className="lift-btn lift-up" {...holdHandlers("up")}>▲ Up</button>
           <button className="lift-btn lift-stop" onClick={() => lift("stop")}>■ Stop</button>
           <button className="lift-btn lift-down" {...holdHandlers("down")}>▼ Down</button>
+
+          <h3 className="sidebar-h3-spaced">Base / wheels</h3>
+          <label className="gamepad-toggle">
+            <input
+              type="checkbox"
+              checked={gamepadEnabled}
+              onChange={(e) => setGamepadEnabled(e.target.checked)}
+            />
+            Gamepad enabled
+          </label>
+          <div className="gamepad-name">{gamepadName}</div>
         </aside>
         <main className="remote-main">
           <div className="remote-cams">
