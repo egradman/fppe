@@ -429,14 +429,16 @@ class APIHandler(BaseHTTPRequestHandler):
             while True:
                 frame = reader.latest
                 if frame is not None:
-                    small = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_NEAREST)
-                    _, jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    # Capped at ~15 fps per stream below; keep the encode lean
+                    # so the UDP teleop thread isn't starved of CPU on the Pi.
+                    small = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
+                    _, jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 60])
                     self.wfile.write(b"--frame\r\n")
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
                     self.wfile.write(f"Content-Length: {len(jpg)}\r\n\r\n".encode())
                     self.wfile.write(jpg.tobytes())
                     self.wfile.write(b"\r\n")
-                time.sleep(0.05)  # ~20 fps
+                time.sleep(1 / 15)  # ~15 fps cap per stream
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -750,23 +752,47 @@ def main():
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self._lock = threading.Lock()
+            self._cond = threading.Condition()  # also serves as the lock
             self._frame = None
+            self._version = 0  # bumped on every new frame
             self._running = True
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
 
         def _loop(self):
+            # Cap the read rate well below the camera's native fps. The
+            # streamer only sends 15 fps anyway, and burning CPU + GIL on
+            # 30+ fps reads we'll never use was starving the UDP teleop
+            # listener thread.
+            target_period = 1.0 / 20.0
+            next_t = time.monotonic()
             while self._running:
                 ret, frame = self.cap.read()
                 if ret:
-                    with self._lock:
+                    with self._cond:
                         self._frame = frame
+                        self._version += 1
+                        self._cond.notify_all()
+                next_t += target_period
+                slack = next_t - time.monotonic()
+                if slack > 0:
+                    time.sleep(slack)
+                else:
+                    next_t = time.monotonic()  # we fell behind; resync
 
         @property
         def latest(self) -> np.ndarray | None:
-            with self._lock:
+            with self._cond:
                 return self._frame
+
+        def wait_for_new(
+            self, last_version: int, timeout: float
+        ) -> tuple[np.ndarray | None, int]:
+            """Block until a frame newer than `last_version` arrives, or timeout."""
+            with self._cond:
+                if self._version == last_version:
+                    self._cond.wait(timeout=timeout)
+                return self._frame, self._version
 
         def release(self):
             # Order matters: releasing the capture first cancels any in-flight

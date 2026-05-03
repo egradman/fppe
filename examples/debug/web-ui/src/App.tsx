@@ -294,18 +294,63 @@ function RemoteTeleopPanel() {
 
   const active = mode === "remote";
 
+  const lift = (action: "up" | "down" | "stop") => {
+    fetch(`${API_BASE}/lift`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    }).catch(() => {});
+  };
+
+  // Press-and-hold: send "up"/"down" on press, "stop" on release. Mirrors the
+  // viser scene's btn_z_up / btn_z_down behavior.
+  const holdHandlers = (action: "up" | "down") => ({
+    onPointerDown: (e: React.PointerEvent) => {
+      e.currentTarget.setPointerCapture(e.pointerId);
+      lift(action);
+    },
+    onPointerUp: () => lift("stop"),
+    onPointerCancel: () => lift("stop"),
+    onPointerLeave: (e: React.PointerEvent) => {
+      // Only stop if the pointer was actually pressed when it left.
+      if (e.buttons !== 0) lift("stop");
+    },
+  });
+
   return (
     <div className="remote-teleop">
       <div className={`teleop-status ${active ? "on" : "off"}`}>
         Remote teleop {active ? "ACTIVE" : "inactive"} — UDP stream from skynet
         drives the arms
       </div>
-      <iframe
-        src={`http://${HOST}:${VISER_PORT}`}
-        className="urdf-frame"
-        title="Viser URDF"
-        allow="autoplay; fullscreen; webgl"
-      />
+      <div className="remote-teleop-body">
+        <aside className="remote-sidebar">
+          <h3>Lift</h3>
+          <button className="lift-btn lift-up" {...holdHandlers("up")}>▲ Up</button>
+          <button className="lift-btn lift-stop" onClick={() => lift("stop")}>■ Stop</button>
+          <button className="lift-btn lift-down" {...holdHandlers("down")}>▼ Down</button>
+        </aside>
+        <main className="remote-main">
+          <div className="remote-cams">
+            <img
+              src={`${API_BASE}/mjpeg/cam0`}
+              className="remote-cam"
+              alt="Camera 0"
+            />
+            <img
+              src={`${API_BASE}/mjpeg/cam1`}
+              className="remote-cam"
+              alt="Camera 1"
+            />
+          </div>
+          <iframe
+            src={`http://${HOST}:${VISER_PORT}`}
+            className="remote-urdf-frame"
+            title="Viser URDF"
+            allow="autoplay; fullscreen; webgl"
+          />
+        </main>
+      </div>
     </div>
   );
 }
