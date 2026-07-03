@@ -6,6 +6,10 @@ const API_PORT = 8091;
 const VISER_PORT = 8090;
 const API_BASE = `http://${HOST}:${API_PORT}`;
 
+const GAMEPAD_DEADZONE = 0.1;
+const applyDeadzone = (vals: number[]): number[] =>
+  vals.map((v) => (Math.abs(v) < GAMEPAD_DEADZONE ? 0 : v));
+
 type Tab = "controls" | "local-teleop" | "remote-teleop" | "cam0" | "cam1";
 
 function App() {
@@ -22,6 +26,7 @@ function App() {
   return (
     <div className="app">
       <EstopBanner />
+      <BaseInputSelector />
       <nav className="tab-bar">
         {tabs.map((tab) => (
           <button
@@ -96,6 +101,62 @@ function EstopBanner() {
   return <div className="estop-banner">E-STOP ENGAGED — motors unpowered</div>;
 }
 
+// Explicit-enable selector for which input source owns the wheels + lift.
+// Mirrors the backend's BaseInputSource state; default is "off" so nothing
+// drives the base until the operator deliberately picks a source.
+function BaseInputSelector() {
+  const [value, setValue] = useState<string>("off");
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/state`);
+        const j = await r.json();
+        if (!cancelled) setValue(String(j.base_input_source ?? "off"));
+      } catch {
+        // ignore — EstopBanner already surfaces unreachable
+      }
+    };
+    poll();
+    const id = setInterval(poll, 500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const select = (next: string) => {
+    setValue(next); // optimistic — poll will reconcile
+    fetch(`${API_BASE}/base_input_source`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value: next }),
+    }).catch(() => {});
+  };
+
+  const options: { id: string; label: string }[] = [
+    { id: "off", label: "Off" },
+    { id: "gamepad", label: "Gamepad" },
+    { id: "pedals", label: "Pedals" },
+  ];
+
+  return (
+    <div className="base-input-selector">
+      <span className="base-input-label">Base driver:</span>
+      {options.map((o) => (
+        <button
+          key={o.id}
+          className={`base-input-btn ${value === o.id ? "active" : ""}`}
+          onClick={() => select(o.id)}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // Polls the browser Gamepad API at frame rate, mirrors axes/buttons into
 // state, and pushes them to /gamepad at ~30 Hz. The `enabled` flag is sent
 // through to the backend (the watchdog coasts wheels/lift to halt when off).
@@ -138,7 +199,7 @@ function useGamepadPump(enabled: boolean) {
 
       if (gp) {
         setGamepadName(gp.id);
-        const a = Array.from(gp.axes);
+        const a = applyDeadzone(Array.from(gp.axes));
         const b = gp.buttons.map((btn) => btn.pressed);
         setAxes(a);
         setButtons(b);
