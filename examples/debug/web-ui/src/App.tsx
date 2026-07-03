@@ -1,19 +1,32 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
+import FaceTab from "./FaceTab";
 
 const HOST = window.location.hostname;
 const API_PORT = 8091;
 const VISER_PORT = 8090;
 const API_BASE = `http://${HOST}:${API_PORT}`;
 
+// The behavior-tree conductor runs on skynet and owns mode switching. The UI
+// (served from the Pi) requests modes from it instead of poking the Pi's
+// base_input_source directly. Override with ?conductor=host:port for other hosts.
+const CONDUCTOR_BASE =
+  new URLSearchParams(location.search).get("conductor")
+    ? `http://${new URLSearchParams(location.search).get("conductor")}`
+    : "http://skynet:8100";
+
 const GAMEPAD_DEADZONE = 0.1;
 const applyDeadzone = (vals: number[]): number[] =>
   vals.map((v) => (Math.abs(v) < GAMEPAD_DEADZONE ? 0 : v));
 
-type Tab = "controls" | "local-teleop" | "remote-teleop" | "cam0" | "cam1";
+type Tab = "controls" | "local-teleop" | "remote-teleop" | "cam0" | "cam1" | "face";
 
 function App() {
-  const [activeTab, setActiveTab] = useState<Tab>("controls");
+  const [activeTab, setActiveTab] = useState<Tab>("face");
+  const status = useConductorStatus();
+  // One app-level gamepad pump, enabled whenever the tree is in local_teleop —
+  // regardless of which tab is showing. The mode IS the enable signal; no toggle.
+  const pump = useGamepadPump(status.mission === "local_teleop");
 
   const tabs: { id: Tab; label: string }[] = [
     { id: "controls", label: "Controls" },
@@ -21,12 +34,23 @@ function App() {
     { id: "remote-teleop", label: "Remote Teleop" },
     { id: "cam0", label: "Camera 0" },
     { id: "cam1", label: "Camera 1" },
+    { id: "face", label: "Face" },
   ];
+
+  // Face mode is a chromeless full-screen view: no e-stop banner, mode selector,
+  // or tab bar. Tapping anywhere on the face returns to the tabbed interface.
+  if (activeTab === "face") {
+    return (
+      <div className="app app-face" onClick={() => setActiveTab("controls")}>
+        <FaceTab />
+      </div>
+    );
+  }
 
   return (
     <div className="app">
       <EstopBanner />
-      <BaseInputSelector />
+      <ModeSelector status={status} />
       <nav className="tab-bar">
         {tabs.map((tab) => (
           <button
@@ -47,7 +71,9 @@ function App() {
             allow="autoplay; fullscreen; webgl"
           />
         )}
-        {activeTab === "local-teleop" && <LocalTeleopPanel />}
+        {activeTab === "local-teleop" && (
+          <LocalTeleopPanel pump={pump} active={status.mission === "local_teleop"} />
+        )}
         {activeTab === "remote-teleop" && <RemoteTeleopPanel />}
         {activeTab === "cam0" && (
           <img
@@ -101,21 +127,43 @@ function EstopBanner() {
   return <div className="estop-banner">E-STOP ENGAGED — motors unpowered</div>;
 }
 
-// Explicit-enable selector for which input source owns the wheels + lift.
-// Mirrors the backend's BaseInputSource state; default is "off" so nothing
-// drives the base until the operator deliberately picks a source.
-function BaseInputSelector() {
-  const [value, setValue] = useState<string>("off");
+// Mode selector — the single control for robot modes now that the behavior-tree
+// conductor owns mode switching. Polls the conductor's /status for the current
+// mission + available modes and POSTs /mission to switch. Replaces the old direct
+// base_input_source selector (the tree sets base_input_source as part of a mode).
+// The voice/LLM face agent will drive these same endpoints as a tool.
+type ConductorStatus = {
+  mission: string;
+  modes: string[];
+  estop: boolean;
+  unreachable: boolean;
+};
 
+// Shared poll of the conductor's /status. Drives both the mode dropdown and the
+// app-level gamepad pump, so the joystick follows the active mode rather than a
+// separate on-screen toggle.
+function useConductorStatus(): ConductorStatus {
+  const [s, setS] = useState<ConductorStatus>({
+    mission: "—",
+    modes: [],
+    estop: false,
+    unreachable: false,
+  });
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
       try {
-        const r = await fetch(`${API_BASE}/state`);
+        const r = await fetch(`${CONDUCTOR_BASE}/status`);
         const j = await r.json();
-        if (!cancelled) setValue(String(j.base_input_source ?? "off"));
+        if (!cancelled)
+          setS({
+            mission: String(j.mission ?? "—"),
+            modes: Array.isArray(j.modes) ? j.modes : [],
+            estop: Boolean(j.estop),
+            unreachable: false,
+          });
       } catch {
-        // ignore — EstopBanner already surfaces unreachable
+        if (!cancelled) setS((p) => ({ ...p, unreachable: true }));
       }
     };
     poll();
@@ -125,34 +173,49 @@ function BaseInputSelector() {
       clearInterval(id);
     };
   }, []);
+  return s;
+}
 
-  const select = (next: string) => {
-    setValue(next); // optimistic — poll will reconcile
-    fetch(`${API_BASE}/base_input_source`, {
+function ModeSelector({ status }: { status: ConductorStatus }) {
+  const { mission, modes, estop, unreachable } = status;
+
+  const select = (name: string) => {
+    fetch(`${CONDUCTOR_BASE}/mission`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ value: next }),
+      body: JSON.stringify({ name }),
     }).catch(() => {});
   };
 
-  const options: { id: string; label: string }[] = [
-    { id: "off", label: "Off" },
-    { id: "gamepad", label: "Gamepad" },
-    { id: "pedals", label: "Pedals" },
-  ];
+  const abort = () => {
+    fetch(`${CONDUCTOR_BASE}/abort`, { method: "POST" }).catch(() => {});
+  };
 
+  const known = modes.includes(mission);
   return (
-    <div className="base-input-selector">
-      <span className="base-input-label">Base driver:</span>
-      {options.map((o) => (
-        <button
-          key={o.id}
-          className={`base-input-btn ${value === o.id ? "active" : ""}`}
-          onClick={() => select(o.id)}
-        >
-          {o.label}
-        </button>
-      ))}
+    <div className="mode-selector">
+      {estop && <span className="mode-estop">E-STOP</span>}
+      <label className="mode-label" htmlFor="mode-dd">Mode</label>
+      <select
+        id="mode-dd"
+        className="mode-dropdown"
+        value={known ? mission : "__current__"}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (v === "__abort__") abort();
+          else if (v !== "__current__") select(v);
+        }}
+        disabled={unreachable}
+      >
+        {unreachable && <option value="__current__">conductor unreachable</option>}
+        {!unreachable && !known && (
+          <option value="__current__" disabled>{mission}</option>
+        )}
+        {modes.map((m) => (
+          <option key={m} value={m}>{m}</option>
+        ))}
+        {!unreachable && <option value="__abort__">↺ abort → idle</option>}
+      </select>
     </div>
   );
 }
@@ -205,7 +268,7 @@ function useGamepadPump(enabled: boolean) {
         setButtons(b);
 
         const now = performance.now();
-        if (now - lastSend > 33) {
+        if (enabledRef.current && now - lastSend > 33) {
           lastSend = now;
           fetch(`${API_BASE}/gamepad`, {
             method: "POST",
@@ -247,23 +310,29 @@ function useGamepadPump(enabled: boolean) {
     };
   }, []);
 
+  // Coast promptly when disabled (e.g. mode switched away from local_teleop):
+  // one enabled:false so the Pi's watchdog stops wheels/lift without waiting.
+  useEffect(() => {
+    if (!enabled) {
+      fetch(`${API_BASE}/gamepad`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ axes: [], buttons: [], enabled: false }),
+      }).catch(() => {});
+    }
+  }, [enabled]);
+
   return { gamepadName, axes, buttons, hz };
 }
 
-function LocalTeleopPanel() {
-  const [enabled, setEnabled] = useState(false);
-  const { gamepadName, axes, buttons, hz } = useGamepadPump(enabled);
-
-  // Tell the backend the operator selected local teleop. The backend
-  // gates the gamepad/UDP paths on this so only one input source has
-  // authority at a time.
-  useEffect(() => {
-    fetch(`${API_BASE}/teleop_mode`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: "local" }),
-    }).catch(() => {});
-  }, []);
+function LocalTeleopPanel({
+  pump,
+  active,
+}: {
+  pump: { gamepadName: string; axes: number[]; buttons: boolean[]; hz: string };
+  active: boolean;
+}) {
+  const { gamepadName, axes, buttons, hz } = pump;
 
   const lx = axes[0] ?? 0;
   const ly = axes[1] ?? 0;
@@ -272,19 +341,14 @@ function LocalTeleopPanel() {
 
   return (
     <div className="teleop">
-      <div className={`teleop-status ${enabled ? "on" : "off"}`}>
-        Teleop {enabled ? "ACTIVE" : "disabled"} — {gamepadName}
+      <div className={`teleop-status ${active ? "on" : "off"}`}>
+        Local teleop {active ? "ACTIVE" : "inactive — pick ‘local_teleop’ mode"} —{" "}
+        {gamepadName}
       </div>
-
-      <label className="teleop-toggle">
-        <input
-          type="checkbox"
-          checked={enabled}
-          onChange={(e) => setEnabled(e.target.checked)}
-        />
-        Enable teleop (left stick = strafe/forward, right stick L/R = rotate,
-        buttons 12/13 = lift)
-      </label>
+      <p className="teleop-hint">
+        Left stick = strafe/forward · right stick L/R = rotate · buttons 12/13 = lift.
+        Driven automatically while the tree is in <code>local_teleop</code>.
+      </p>
 
       <div className="sticks">
         <Stick label="Left Stick" x={lx} y={ly} />

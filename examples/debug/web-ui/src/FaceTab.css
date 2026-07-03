@@ -1,0 +1,134 @@
+/* Purple's face tab. Fills .tab-content (flex:1, position:relative). */
+.face-root {
+  position: absolute;
+  inset: 0;
+  background: #000;
+  overflow: hidden;
+}
+
+.face-box {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* Nudge the whole face up by a fixed pixel amount (screen-accurate, unlike
+     the viewBox-unit FACE_SHIFT_Y in FaceTab.tsx). */
+  transform: translateY(-80px);
+  transition: width 350ms ease, height 350ms ease;
+}
+
+.status-pane {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 70%;
+  padding: 2.5rem 3rem;
+  overflow: auto;
+  box-sizing: border-box;
+  transition: opacity 300ms ease, bottom 300ms ease;
+  color: #f4f4f4;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 1.6rem;
+  line-height: 1.5;
+}
+
+.status-pane h1,
+.status-pane h2,
+.status-pane h3 {
+  color: #b06be0;
+  margin: 0.2em 0 0.4em;
+  font-weight: 600;
+}
+.status-pane h1 { font-size: 2.2rem; }
+.status-pane h2 { font-size: 1.9rem; }
+.status-pane h3 { font-size: 1.7rem; }
+
+.status-pane p { margin: 0.4em 0; }
+
+.status-pane ul,
+.status-pane ol {
+  padding-left: 1.5em;
+  margin: 0.4em 0;
+}
+.status-pane li { margin: 0.2em 0; }
+
+.status-pane li.task-list-item {
+  list-style: none;
+  margin-left: -1.2em;
+}
+
+.status-pane input[type="checkbox"] {
+  transform: scale(1.4);
+  margin-right: 0.6em;
+  accent-color: #b06be0;
+}
+
+.status-pane li.task-list-item:has(input[type="checkbox"]:checked) {
+  color: #7a7a7a;
+  text-decoration: line-through;
+  text-decoration-color: #555;
+}
+
+.status-pane code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+.status-pane pre {
+  background: rgba(255, 255, 255, 0.05);
+  padding: 1em;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.status-pane pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.status-pane a { color: #b06be0; }
+
+.transcript-pane {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0.9rem 2rem;
+  background: transparent;
+  box-sizing: border-box;
+  transition: opacity 300ms ease, transform 300ms ease;
+}
+
+.transcript-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.9rem;
+  color: #f4f4f4;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 1.3rem;
+  line-height: 1.35;
+  padding: 0.15rem 0;
+  min-height: 1.7rem;
+}
+
+.transcript-label {
+  font-weight: 600;
+  min-width: 5rem;
+  text-align: right;
+  opacity: 0.9;
+}
+
+.face-dots {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 6px;
+}
+
+.face-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}

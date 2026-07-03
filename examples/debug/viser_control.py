@@ -18,6 +18,7 @@ HTTP API (on --api-port, default 8091):
   POST /lift                 — {"action": "up"|"down"|"stop"}
   POST /gamepad              — {"axes": [...], "buttons": [bool, ...], "enabled": bool}
   POST /teleop_mode          — {"mode": "local"|"remote"} — see TeleopMode
+  POST /base_input_source    — {"value": "off"|"gamepad"|"pedals"} — see BaseInputSource
 
 The /state response includes "estop_engaged" (bool) read from a Raspberry Pi
 GPIO pin (default GPIO19). The e-stop is inline with motor power, so when
@@ -58,12 +59,18 @@ import viser
 # layout on sys.path.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "leader_teleop" / "src"))
+sys.path.insert(0, str(_REPO_ROOT / "pedal_teleop" / "src"))
+# voice/scripts holds the speech pipeline; imported lazily in start_voice_thread
+# (its top-level `openai`/`sounddevice` deps aren't installed unless --voice is used).
+sys.path.insert(0, str(_REPO_ROOT / "voice" / "scripts"))
 
 from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
+from lerobot.motors.motors_bus import MotorCalibration
 from lerobot.robots.alohamini.config_lekiwi import LeKiwiConfig
 from lerobot.robots.alohamini.lekiwi import LeKiwi
 
 from leader_teleop import wire as leader_wire
+from pedal_teleop import wire as pedal_wire
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -366,6 +373,37 @@ class TeleopMode:
         return True
 
 
+class BaseInputSource:
+    """Which input source is allowed to drive the wheels + lift.
+
+    'off'     — no input authority; wheels/lift coast to stop and stay there.
+    'gamepad' — the web gamepad's axes/buttons drive wheels + lift.
+    'pedals'  — UDP packets from the skynet-side pedal_teleop drive wheels +
+                lift. The web gamepad is silently dropped for the base.
+
+    Disjoint from TeleopMode, which gates the arms. E-stop overrides both.
+    Default is 'off' — explicit-enable for safety.
+    """
+
+    _VALUES = ("off", "gamepad", "pedals")
+
+    def __init__(self, initial: str = "off"):
+        self._lock = threading.Lock()
+        self._value = initial if initial in self._VALUES else "off"
+
+    @property
+    def value(self) -> str:
+        with self._lock:
+            return self._value
+
+    def set(self, value: str) -> bool:
+        if value not in self._VALUES:
+            return False
+        with self._lock:
+            self._value = value
+        return True
+
+
 class GamepadState:
     """Latest gamepad state posted by the browser; consumed by the main loop."""
 
@@ -398,6 +436,7 @@ class APIHandler(BaseHTTPRequestHandler):
     camera_readers: dict  # label -> CameraReader
     gamepad_state: "GamepadState"
     teleop_mode: "TeleopMode"
+    base_input_source: "BaseInputSource"
 
     def _json_response(self, code: int, data: dict):
         body = json.dumps(data).encode()
@@ -466,6 +505,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.path == "/state":
             snap = self.robot_state.snapshot()
             snap["teleop_mode"] = self.teleop_mode.mode
+            snap["base_input_source"] = self.base_input_source.value
             self._json_response(200, snap)
         elif self.path.startswith("/mjpeg/"):
             label = self.path.split("/mjpeg/", 1)[1]
@@ -532,6 +572,26 @@ class APIHandler(BaseHTTPRequestHandler):
             self.gamepad_state.update(axes, buttons, enabled)
             self._json_response(200, {"ok": True})
 
+        elif self.path == "/gripper_calibration":
+            # {"side": "left"|"right", "bound": "min"|"max"|"loosen"}
+            # min/max captures the gripper's current Present_Position as the
+            # new range_min/range_max; loosen widens motor limits so the
+            # operator can drive past the current range during calibration.
+            # All three persist to motor EEPROM and the on-disk calibration JSON.
+            side = body.get("side")
+            bound = body.get("bound")
+            if side not in ("left", "right") or bound not in ("min", "max", "loosen"):
+                self._json_response(
+                    400,
+                    {"error": "side must be 'left' or 'right', bound must be 'min', 'max', or 'loosen'"},
+                )
+                return
+            if bound == "loosen":
+                self.cmd_queue.put(("loosen_gripper_range", side))
+            else:
+                self.cmd_queue.put(("set_gripper_range", side, bound))
+            self._json_response(200, {"ok": True})
+
         elif self.path == "/teleop_mode":
             # {"mode": "local"|"remote"}
             mode = body.get("mode")
@@ -539,6 +599,22 @@ class APIHandler(BaseHTTPRequestHandler):
                 self._json_response(400, {"error": "mode must be 'local' or 'remote'"})
                 return
             self._json_response(200, {"ok": True, "mode": self.teleop_mode.mode})
+
+        elif self.path == "/base_input_source":
+            # {"value": "off"|"gamepad"|"pedals"}
+            value = body.get("value")
+            if not self.base_input_source.set(value):
+                self._json_response(
+                    400, {"error": "value must be 'off', 'gamepad', or 'pedals'"}
+                )
+                return
+            # Any source change immediately halts the base + lift so the next
+            # source starts from a known stopped state.
+            self.cmd_queue.put(("wheels_stop",))
+            self.cmd_queue.put(("lift_stop",))
+            self._json_response(
+                200, {"ok": True, "value": self.base_input_source.value}
+            )
 
         else:
             self.send_error(404)
@@ -561,12 +637,14 @@ def start_api_server(
     camera_readers: dict,
     gamepad_state: GamepadState,
     teleop_mode: TeleopMode,
+    base_input_source: BaseInputSource,
 ):
     APIHandler.robot_state = robot_state
     APIHandler.cmd_queue = cmd_queue
     APIHandler.camera_readers = camera_readers
     APIHandler.gamepad_state = gamepad_state
     APIHandler.teleop_mode = teleop_mode
+    APIHandler.base_input_source = base_input_source
     httpd = ThreadingHTTPServer(("0.0.0.0", port), APIHandler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -657,6 +735,173 @@ def start_leader_udp_listener(
 
 
 # ---------------------------------------------------------------------------
+# Pedal UDP listener: receives pedal-derived body commands from skynet at
+# ~100 Hz and writes wheel velocities + lift commands directly to the bus.
+# Gated by `base_input_source == "pedals"`; ignored otherwise. Owns a 300 ms
+# watchdog: if no fresh packet arrives, wheels + lift are stopped exactly
+# once on the stale edge.
+# ---------------------------------------------------------------------------
+def start_pedal_udp_listener(
+    port: int,
+    bus: FeetechMotorsBus,
+    base_input_source: "BaseInputSource",
+    estop: "EstopMonitor",
+    wheels_available: bool,
+    cmd_queue: queue.Queue,
+) -> tuple[socket.socket, threading.Thread]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", port))
+    sock.settimeout(0.1)
+
+    state = {
+        "last_seq": None,
+        "last_warn": 0.0,
+        "last_fresh": 0.0,
+        "active": False,
+        "last_lift": "stop",
+    }
+
+    def _stop_wheels():
+        if not wheels_available:
+            return
+        try:
+            with _BUS_LOCK:
+                bus.sync_write(
+                    "Goal_Velocity",
+                    {n: 0 for n in WHEEL_NAMES},
+                    normalize=False,
+                )
+        except Exception as e:
+            print(f"Pedal UDP: wheel-stop write failed: {e}")
+
+    def _run():
+        while True:
+            try:
+                data, _addr = sock.recvfrom(4096)
+                got_pkt = True
+            except socket.timeout:
+                data = None
+                got_pkt = False
+            except OSError:
+                return  # socket closed
+
+            now = time.monotonic()
+
+            if got_pkt:
+                try:
+                    pkt = pedal_wire.decode(data)
+                except Exception as e:
+                    if now - state["last_warn"] > 1.0:
+                        print(f"Pedal UDP: decode error: {e}")
+                        state["last_warn"] = now
+                    continue
+
+                if state["last_seq"] is not None and pedal_wire.seq_lt(
+                    pkt.seq, state["last_seq"]
+                ):
+                    continue
+                state["last_seq"] = pkt.seq
+                state["last_fresh"] = now
+
+                # Drop if not the selected source or e-stopped — but keep
+                # tracking last_fresh so the watchdog doesn't fire spuriously
+                # when the source is intentionally off.
+                if base_input_source.value != "pedals" or estop.engaged:
+                    state["active"] = False
+                    state["last_lift"] = "stop"
+                    continue
+
+                if wheels_available:
+                    cmds = body_to_wheel_raw(pkt.x_vel, pkt.y_vel, pkt.theta_vel)
+                    try:
+                        with _BUS_LOCK:
+                            bus.sync_write("Goal_Velocity", cmds, normalize=False)
+                    except Exception as e:
+                        if now - state["last_warn"] > 1.0:
+                            print(f"Pedal UDP: wheel write failed: {e}")
+                            state["last_warn"] = now
+
+                # Only enqueue lift commands on transition — process_commands
+                # writes Goal_Velocity for lift each time, and at 100 Hz we'd
+                # spam the bus otherwise.
+                if pkt.lift != state["last_lift"]:
+                    cmd_queue.put((f"lift_{pkt.lift}",))
+                    state["last_lift"] = pkt.lift
+
+                state["active"] = True
+            else:
+                # No packet this iteration — check watchdog.
+                if state["active"] and (now - state["last_fresh"]) > GAMEPAD_WATCHDOG_S:
+                    if base_input_source.value == "pedals" and not estop.engaged:
+                        _stop_wheels()
+                        if state["last_lift"] != "stop":
+                            cmd_queue.put(("lift_stop",))
+                            state["last_lift"] = "stop"
+                    state["active"] = False
+
+    t = threading.Thread(target=_run, daemon=True, name="pedal-udp")
+    t.start()
+    print(f"Pedal UDP listener: 0.0.0.0:{port}")
+    return sock, t
+
+
+def start_voice_thread(
+    host: str,
+    port: int,
+    stop_event: threading.Event,
+    face_port: int = 8766,
+) -> threading.Thread | None:
+    """Fork the speech pipeline (voice/scripts/listen_and_play_realtime.py) on a
+    daemon thread. It captures the local mic, plays TTS to the local speaker via
+    a realtime connection to the speech server on `host:port` (skynet), and
+    serves the face-state WebSocket on `face_port` for the "Face" tab.
+
+    Imports are deferred to here: the pipeline pulls in `openai`/`sounddevice`,
+    which aren't installed unless voice is in use, and the Pi has no mic until a
+    USB audio device is added. A failure is logged, not fatal — robot control
+    continues even if voice can't start.
+    """
+    import asyncio
+    import traceback
+
+    try:
+        import listen_and_play_realtime as voice
+    except Exception:
+        print("== VOICE disabled: could not import speech pipeline ==", flush=True)
+        print("   (install `openai sounddevice` + libportaudio2 in the env)", flush=True)
+        traceback.print_exc()
+        return None
+
+    prompt_path = _REPO_ROOT / "voice" / "prompt.md"
+    try:
+        instructions = prompt_path.read_text().strip() or None
+    except OSError:
+        instructions = None
+
+    vargs = voice.ListenAndPlayRealtimeArguments(
+        host=host,
+        port=port,
+        block_mic_during_playback=True,
+        face_host="0.0.0.0",
+        face_port=face_port,
+        instructions=instructions,
+    )
+
+    def _run():
+        try:
+            asyncio.run(voice.listen_and_play_realtime(vargs, stop_event))
+        except Exception:
+            print("== VOICE thread crashed (robot control unaffected) ==", flush=True)
+            traceback.print_exc()
+
+    t = threading.Thread(target=_run, daemon=True, name="voice")
+    t.start()
+    print(f"Voice pipeline: speech server {host}:{port}, face WS 0.0.0.0:{face_port}")
+    return t
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -679,6 +924,30 @@ def main():
         type=int,
         default=leader_wire.DEFAULT_PORT,
         help="UDP port to receive leader-arm joint-angle packets from skynet. 0 disables.",
+    )
+    parser.add_argument(
+        "--pedal-udp-port",
+        type=int,
+        default=pedal_wire.DEFAULT_PORT,
+        help="UDP port to receive pedal-derived base commands from skynet. 0 disables.",
+    )
+    parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Fork the speech pipeline (mic in / speaker out via the skynet speech "
+        "server) and serve the Face tab's state WebSocket. Off by default: the Pi "
+        "needs a USB mic/speaker plus `openai sounddevice` + libportaudio2 first.",
+    )
+    parser.add_argument(
+        "--voice-host",
+        default="192.168.68.76",
+        help="Host of the realtime speech server (skynet). Default 192.168.68.76.",
+    )
+    parser.add_argument(
+        "--voice-port",
+        type=int,
+        default=8765,
+        help="Port of the realtime speech server. Default 8765.",
     )
     args = parser.parse_args()
 
@@ -841,6 +1110,8 @@ def main():
     guard = {"updating": False}  # mutable flag shared across threads
     cmd_q: queue.Queue = queue.Queue()
     motor_sliders: dict[str, viser.GuiInputHandle] = {}
+    # side -> (range_min display handle, range_max display handle) for the gripper
+    gripper_displays: dict[str, tuple] = {}
 
     # ---- HTTP API state (server started after GUI is built so the kiosk
     # autostart's wait on port 8091 also implies the viser GUI is ready) ----
@@ -848,6 +1119,7 @@ def main():
     robot_state.update(initial_pos, arm_locked)
     gamepad_state = GamepadState()
     teleop_mode = TeleopMode(initial="local")
+    base_input_source = BaseInputSource(initial="off")
 
     # ---- Build GUI (tabbed sidebar) ----
     tabs = server.gui.add_tab_group()
@@ -909,6 +1181,52 @@ def main():
                 else:
                     cmd_q.put(("unlock_arm", _side))
 
+            # ---- Gripper range calibration ----
+            # Lets the operator drive the gripper to a physical extreme (jaws
+            # closed / fully open) and capture the current raw tick as the new
+            # range_min / range_max. _pct_to_tick uses these to map the 0..100
+            # leader-stream values back to raw ticks, so updating them here
+            # immediately changes the teleop mapping. Persisted to the motor
+            # EEPROM and to the on-disk calibration JSON.
+            gripper_name = f"arm_{side}_gripper"
+            gcal = bus.calibration.get(gripper_name)
+            with server.gui.add_folder("Gripper calibration"):
+                gmin = server.gui.add_number(
+                    f"{prefix} gripper range_min",
+                    initial_value=int(gcal.range_min) if gcal else 0,
+                    disabled=True,
+                )
+                gmax = server.gui.add_number(
+                    f"{prefix} gripper range_max",
+                    initial_value=int(gcal.range_max) if gcal else 4095,
+                    disabled=True,
+                )
+                btn_set_min = server.gui.add_button("Set min from current pos")
+                btn_set_max = server.gui.add_button("Set max from current pos")
+                # The motor enforces Min/Max_Position_Limit on Goal_Position,
+                # so you can't drive past the *current* range_min/max with the
+                # slider. "Loosen" temporarily widens those EEPROM limits to
+                # the slider bounds so calibration can re-tighten them.
+                btn_loosen = server.gui.add_button("Loosen limits (full ROM)")
+            gripper_displays[side] = (gmin, gmax)
+
+            # Use explicit method-call form (not decorator) and a closure
+            # factory so each button captures its own side cleanly. The other
+            # decorator-based handlers in this function rebind `_` repeatedly,
+            # which mostly works but is fragile.
+            def _make_cal_cb(_side: str, _kind: str, _bound: str | None):
+                def cb(_event):
+                    print(f"[gui] gripper-cal click: side={_side} kind={_kind} bound={_bound}", flush=True)
+                    if _kind == "loosen":
+                        cmd_q.put(("loosen_gripper_range", _side))
+                    else:
+                        cmd_q.put(("set_gripper_range", _side, _bound))
+                return cb
+
+            btn_set_min.on_click(_make_cal_cb(side, "set", "min"))
+            btn_set_max.on_click(_make_cal_cb(side, "set", "max"))
+            btn_loosen.on_click(_make_cal_cb(side, "loosen", None))
+
     build_arm_tab("left", left_motors, initial_pos)
     build_arm_tab("right", right_motors, initial_pos)
 
@@ -920,7 +1238,15 @@ def main():
 
     # ---- HTTP API (started after the GUI build so port 8091 only opens
     # once viser's tab tree is ready; the kiosk autostart waits on 8091) ----
-    start_api_server(args.api_port, robot_state, cmd_q, cameras, gamepad_state, teleop_mode)
+    start_api_server(
+        args.api_port,
+        robot_state,
+        cmd_q,
+        cameras,
+        gamepad_state,
+        teleop_mode,
+        base_input_source,
+    )
 
     # ---- Leader UDP listener (skynet -> fppe joint-angle stream) ----
     if args.leader_udp_port > 0:
@@ -932,6 +1258,22 @@ def main():
             teleop_mode=teleop_mode,
             estop=estop,
         )
+
+    # ---- Pedal UDP listener (skynet -> fppe pedal-derived base stream) ----
+    if args.pedal_udp_port > 0:
+        start_pedal_udp_listener(
+            args.pedal_udp_port,
+            bus,
+            base_input_source=base_input_source,
+            estop=estop,
+            wheels_available=wheels_ready,
+            cmd_queue=cmd_q,
+        )
+
+    # ---- Voice pipeline (mic/speaker <-> skynet speech server + Face tab) ----
+    voice_stop = threading.Event()
+    if args.voice:
+        start_voice_thread(args.voice_host, args.voice_port, voice_stop)
 
     @btn_z_up.on_click
     def _(_):
@@ -1042,6 +1384,87 @@ def main():
             elif kind == "lift_stop":
                 _bus_write(bus, "Goal_Velocity", "lift_axis", 0)
 
+            elif kind == "wheels_stop":
+                if wheels_ready:
+                    for name in WHEEL_NAMES:
+                        try:
+                            _bus_write(bus, "Goal_Velocity", name, 0)
+                        except Exception:
+                            pass
+
+            elif kind == "loosen_gripper_range":
+                _, _side = cmd
+                gname = f"arm_{_side}_gripper"
+                existing = bus.calibration.get(gname)
+                if existing is None:
+                    print(f"loosen_gripper_range: no existing calibration for {gname}")
+                    continue
+                # Min/Max_Position_Limit on Feetech servos are uint16; negative
+                # values would be encoded as garbage by scservo_sdk and crash
+                # the bus. Stick to the full single-turn range [0, 4095].
+                new_cal = MotorCalibration(
+                    id=existing.id,
+                    drive_mode=existing.drive_mode,
+                    homing_offset=existing.homing_offset,
+                    range_min=0,
+                    range_max=4095,
+                )
+                with _BUS_LOCK:
+                    bus.write_calibration({gname: new_cal}, cache=False)
+                bus.calibration[gname] = new_cal
+                try:
+                    r._save_calibration()
+                except Exception as e:
+                    print(f"loosen_gripper_range: failed to persist calibration JSON: {e}")
+                disp = gripper_displays.get(_side)
+                if disp is not None:
+                    guard["updating"] = True
+                    disp[0].value = int(new_cal.range_min)
+                    disp[1].value = int(new_cal.range_max)
+                    guard["updating"] = False
+                print(
+                    f"gripper {_side}: limits loosened to {new_cal.range_min}..{new_cal.range_max} "
+                    "— drive to extremes and click Set min / Set max to re-tighten"
+                )
+
+            elif kind == "set_gripper_range":
+                _, _side, bound = cmd
+                gname = f"arm_{_side}_gripper"
+                existing = bus.calibration.get(gname)
+                if existing is None:
+                    print(f"set_gripper_range: no existing calibration for {gname}")
+                    continue
+                with _BUS_LOCK:
+                    cur = bus.sync_read("Present_Position", [gname], normalize=False)
+                raw = int(cur[gname])
+                new_cal = MotorCalibration(
+                    id=existing.id,
+                    drive_mode=existing.drive_mode,
+                    homing_offset=existing.homing_offset,
+                    range_min=raw if bound == "min" else existing.range_min,
+                    range_max=raw if bound == "max" else existing.range_max,
+                )
+                # cache=False so we don't replace the bus's whole dict (which is
+                # the same object as r.calibration); mutate the shared dict in
+                # place instead so both views stay consistent.
+                with _BUS_LOCK:
+                    bus.write_calibration({gname: new_cal}, cache=False)
+                bus.calibration[gname] = new_cal
+                try:
+                    r._save_calibration()
+                except Exception as e:
+                    print(f"set_gripper_range: failed to persist calibration JSON: {e}")
+                disp = gripper_displays.get(_side)
+                if disp is not None:
+                    guard["updating"] = True
+                    disp[0].value = int(new_cal.range_min)
+                    disp[1].value = int(new_cal.range_max)
+                    guard["updating"] = False
+                print(
+                    f"gripper {_side}: {bound}={raw} "
+                    f"(range now {new_cal.range_min}..{new_cal.range_max})"
+                )
+
     # ---- Gamepad → wheels + lift ----
     teleop_active = {"on": False}  # tracks whether wheels are currently driven by gamepad
 
@@ -1063,6 +1486,14 @@ def main():
     def process_gamepad():
         if estop.engaged:
             teleop_active["on"] = False
+            return
+        if base_input_source.value != "gamepad":
+            # Pedals or "off" owns wheels+lift; silently drop. Coast once on
+            # the edge so we don't leave the base spinning when the operator
+            # switches sources mid-motion.
+            if teleop_active["on"]:
+                _stop_wheels_and_lift()
+                teleop_active["on"] = False
             return
         if teleop_mode.mode not in ("local", "remote"):
             # No input authority at all — coast the base/lift down once.
@@ -1104,12 +1535,27 @@ def main():
             teleop_active["on"] = False
 
     # ---- Main loop ----
+    # Catch C-level crashes (segfault, abort, sigbus) and dump a Python stack
+    # before exiting. Combined with the broad try/except inside the loop, this
+    # leaves us a fighting chance at debugging silent deaths.
+    import faulthandler, traceback as _tb
+    faulthandler.enable()
     print("Control loop running. Press Ctrl-C to quit.")
     estop_was_engaged = estop.engaged
     try:
         while True:
-            process_commands()
-            process_gamepad()
+            try:
+                process_commands()
+                process_gamepad()
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                print("== EXCEPTION in main loop body ==", flush=True)
+                _tb.print_exc()
+                # Don't swallow forever — but a one-off serial error shouldn't
+                # take the whole control plane down.
+                time.sleep(0.05)
+                continue
 
             if estop.engaged:
                 if not estop_was_engaged:
@@ -1171,6 +1617,9 @@ def main():
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
+        # Signal the voice thread to close its audio streams / WS server. It's a
+        # daemon thread, so this is best-effort graceful cleanup, not required.
+        voice_stop.set()
         try:
             _bus_write(bus, "Goal_Velocity", "lift_axis", 0)
         except Exception:

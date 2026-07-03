@@ -1,0 +1,13 @@
+# Purple's voice pipeline. In production this runs forked from viser_control.py
+# on the fppe Pi (`viser_control.py --voice`); the face is a tab in the web-ui.
+# These recipes are for standalone debugging of the pipeline on its own.
+
+# Run the speech client standalone (mic in / speaker out via the skynet server).
+# Serves the face-state WS on :8766 for the Face tab. Needs a mic + speaker and
+# `openai sounddevice` + libportaudio2 installed.
+listen:
+    uv run python scripts/listen_and_play_realtime.py --host 192.168.68.76 --port 8765 --block-mic-during-playback --face-host 0.0.0.0 --instructions "$(cat prompt.md)"
+
+# Watch status.md and broadcast it to the Face tab's status pane on :8767.
+status:
+    uv run python scripts/status_server.py --host 0.0.0.0 --file status.md
