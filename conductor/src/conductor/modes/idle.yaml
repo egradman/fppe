@@ -1,0 +1,9 @@
+# idle — the safe/default mode. Base source off, arms in local (leader path
+# gated off). Completes SUCCESS and simply rests; the engine treats idle as the
+# fallback when nothing else is queued.
+type: sequence
+name: idle
+memory: true
+children:
+  - { type: set_base_source, params: { value: "off" } }
+  - { type: set_teleop_mode, params: { mode: "local" } }

@@ -37,6 +37,12 @@ LIFT_SAMPLES_TO_TRIGGER = 2
 
 STEPS_PER_DEG = 4096.0 / 360.0
 
+GAMEPAD_DEADZONE = 0.1
+
+
+def apply_deadzone(vals: List[float]) -> List[float]:
+    return [0.0 if abs(v) < GAMEPAD_DEADZONE else v for v in vals]
+
 
 def degps_to_raw(degps: float) -> int:
     mag = int(round(abs(degps) * STEPS_PER_DEG))
@@ -107,7 +113,7 @@ def main():
 
     try:
         while True:
-            axes = gamepad.get_axes()
+            axes = apply_deadzone(gamepad.get_axes())
             buttons = gamepad.get_buttons()
 
             # -- Wheels: left stick x/y + right stick rotation -- #

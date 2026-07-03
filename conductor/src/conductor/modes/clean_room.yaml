@@ -1,0 +1,14 @@
+# clean_room — a multi-step activity demonstrating sequenceable composition:
+# navigate, do arm work, navigate again. STUB (depends on nav), but shows how a
+# higher-level mission is just a Sequence of behaviors and sub-modes an LLM can
+# assemble.
+type: sequence
+name: clean_room
+memory: true
+children:
+  - { type: navigate_to, params: { location: "kitchen" } }
+  - { type: go_preset, params: { preset: "arms_up" } }
+  - { type: sleep, params: { seconds: 2 } }
+  - { type: navigate_to, params: { location: "living_room" } }
+  - { type: go_preset, params: { preset: "home" } }
+  - { type: hold, name: "clean_done" }

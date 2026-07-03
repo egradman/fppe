@@ -1,0 +1,20 @@
+[project]
+name = "pedal_teleop"
+version = "0.1.0"
+description = "Skynet-side foot-pedal IMU reader + UDP streamer for the LeKiwi base."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pydantic>=2.0",
+    "pyserial>=3.5",
+]
+
+[project.scripts]
+pedal-teleop = "pedal_teleop.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pedal_teleop"]

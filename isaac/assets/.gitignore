@@ -1,0 +1,8 @@
+# Generated USD outputs and Isaac caches — too large for git.
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.usd.*
+materials/
+textures/

@@ -1,0 +1,17 @@
+# teleop — full remote teleoperation: leader arms + foot-pedal base.
+#
+# Sets remote arm mode, locks both arms, launches the leader sender, selects the
+# pedal base source, launches the pedal sender, then holds forever. On any
+# preemption/swap (mode change or e-stop) the subtree is invalidated, which kills
+# both senders (StartSender.terminate on INVALID) and the engine's next mission
+# resets the Pi-side switches.
+type: sequence
+name: teleop
+memory: true
+children:
+  - { type: set_teleop_mode, params: { mode: "remote" } }
+  - { type: lock_arm, params: { side: "both", lock: true } }
+  - { type: start_sender, params: { sender: "leader" } }
+  - { type: set_base_source, params: { value: "pedals" } }
+  - { type: start_sender, params: { sender: "pedal" } }
+  - { type: hold, name: "teleop_active" }

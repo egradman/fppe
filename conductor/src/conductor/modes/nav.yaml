@@ -1,0 +1,9 @@
+# nav — autonomous navigation to a named location.
+#
+# STUB: navigate_to reports FAILURE until the Phase-3 nav integration lands
+# (a "nav" value in viser_control's BaseInputSource + a nav UDP sender). The
+# structure below is the real target shape.
+type: navigate_to
+name: nav
+params:
+  location: "kitchen"

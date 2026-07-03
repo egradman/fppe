@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pedal_teleop test track</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0d1224; color: #dfe4ee;
+               font-family: ui-monospace, Menlo, Consolas, monospace;
+               overflow: hidden; }
+  canvas    { display: block; }
+  #hud      { position: fixed; top: 12px; left: 12px;
+              background: rgba(10, 14, 28, 0.6);
+              border: 1px solid #2a3550; border-radius: 4px;
+              padding: 10px 14px; font-size: 13px; line-height: 1.55;
+              pointer-events: none; }
+  #hud .v   { color: #53a8ff; }
+  #hud .s   { color: #c0392b; font-weight: 700; }
+  #help     { position: fixed; bottom: 10px; left: 12px;
+              color: #8892a8; font-size: 11px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="help">follow-behind cam · grid = 1 m · pole = lift</div>
+<script>
+"use strict";
+
+const cnv = document.getElementById("c");
+const ctx = cnv.getContext("2d");
+const hud = document.getElementById("hud");
+
+let w = 0, h = 0;
+function resize() {
+  w = cnv.width = window.innerWidth;
+  h = cnv.height = window.innerHeight;
+}
+window.addEventListener("resize", resize);
+resize();
+
+// Latest command from pedal_teleop via SSE.
+let cmd = { x_vel: 0, y_vel: 0, theta_vel: 0, lift: "stop", ts: 0, stale: true };
+let lastEventAt = 0;
+const ev = new EventSource("/events");
+ev.onmessage = (m) => {
+  try {
+    cmd = JSON.parse(m.data);
+    lastEventAt = performance.now();
+  } catch {}
+};
+ev.onerror = () => { /* EventSource auto-reconnects */ };
+
+// World state. car.x/y in meters, car.theta radians (0 = +X world, +CCW).
+const car = { x: 0, y: 0, theta: Math.PI / 2 };   // start facing +Y world
+let lift = 0;        // arbitrary "pole height" units
+const LIFT_RATE = 0.6;
+const LIFT_MAX = 4.0;
+const PX_PER_M = 50;
+// The real robot caps at ~0.2 m/s, which is fine to *drive* but feels glacial
+// when scrubbing a virtual track. Scale only the linear velocity for the
+// in-browser integration; rotation already feels good at the true 80 deg/s.
+// HUD still shows the unscaled command values so calibration tests stay honest.
+const LIN_VEL_GAIN = 20;
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+
+  // Treat SSE silence > 0.5 s as stale, even if the last packet didn't
+  // mark itself stale.
+  const stale = cmd.stale || (now - lastEventAt) > 500;
+  const x_vel = stale ? 0 : cmd.x_vel * LIN_VEL_GAIN;
+  const y_vel = stale ? 0 : cmd.y_vel * LIN_VEL_GAIN;  // +y = strafe-left
+  const th_vel = stale ? 0 : cmd.theta_vel;            // deg/s, +CCW
+  const liftCmd = stale ? "stop" : cmd.lift;
+
+  // Body-frame velocity -> world frame, given car heading.
+  const c = Math.cos(car.theta), s = Math.sin(car.theta);
+  car.x += (x_vel * c - y_vel * s) * dt;
+  car.y += (x_vel * s + y_vel * c) * dt;
+  car.theta += (th_vel * Math.PI / 180) * dt;
+
+  if (liftCmd === "up")   lift = Math.min(LIFT_MAX, lift + LIFT_RATE * dt);
+  if (liftCmd === "down") lift = Math.max(0, lift - LIFT_RATE * dt);
+
+  draw(stale);
+  updateHud(stale);
+  requestAnimationFrame(frame);
+}
+
+function draw(stale) {
+  ctx.fillStyle = "#0d1224";
+  ctx.fillRect(0, 0, w, h);
+
+  const cx = w / 2, cy = h / 2;
+
+  // Follow-behind camera:
+  //   1. translate canvas origin to center
+  //   2. scale so 1 unit = 1 m (and flip y so math-y points up)
+  //   3. rotate so the car's heading aligns with screen "up"
+  //   4. translate so the car sits at origin
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(PX_PER_M, -PX_PER_M);
+  ctx.rotate(Math.PI / 2 - car.theta);
+  ctx.translate(-car.x, -car.y);
+
+  // Grid lines at integer meters. Use a screen-diagonal radius so the grid
+  // fills the canvas regardless of rotation.
+  const visR = Math.sqrt(w * w + h * h) / (2 * PX_PER_M) + 1;
+  const minX = Math.floor(car.x - visR);
+  const maxX = Math.ceil(car.x + visR);
+  const minY = Math.floor(car.y - visR);
+  const maxY = Math.ceil(car.y + visR);
+
+  ctx.strokeStyle = "#2a3550";
+  ctx.lineWidth = 1 / PX_PER_M;
+  ctx.beginPath();
+  for (let x = minX; x <= maxX; x++) {
+    ctx.moveTo(x, minY); ctx.lineTo(x, maxY);
+  }
+  for (let y = minY; y <= maxY; y++) {
+    ctx.moveTo(minX, y); ctx.lineTo(maxX, y);
+  }
+  ctx.stroke();
+
+  // Origin highlight (where the car started).
+  ctx.fillStyle = "#1f6feb";
+  ctx.beginPath();
+  ctx.arc(0, 0, 0.08, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.restore();
+
+  // Car fixed at center pointing up. We're back in screen space (y down).
+  ctx.save();
+  ctx.translate(cx, cy);
+
+  // Body: rounded triangle, tip up.
+  ctx.fillStyle = stale ? "#445069" : "#53a8ff";
+  ctx.strokeStyle = stale ? "#5a6783" : "#9bcaff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, -22);
+  ctx.lineTo(-14, 14);
+  ctx.lineTo(0, 9);
+  ctx.lineTo(14, 14);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Lift pole sticking up.
+  if (lift > 0.001) {
+    const poleScreenLen = lift * 40;       // 40 px per "unit"
+    ctx.strokeStyle = "#ffd84a";
+    ctx.lineWidth = 3;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(0, -8);
+    ctx.lineTo(0, -8 - poleScreenLen);
+    ctx.stroke();
+    ctx.fillStyle = "#ffd84a";
+    ctx.beginPath();
+    ctx.arc(0, -8 - poleScreenLen, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+function updateHud(stale) {
+  const fmt = (n, d = 3) => (n >= 0 ? "+" : "") + n.toFixed(d);
+  const headingDeg = ((car.theta * 180 / Math.PI) % 360 + 360) % 360;
+  hud.innerHTML = `
+    x_vel  <span class="v">${fmt(cmd.x_vel)}</span> m/s<br>
+    y_vel  <span class="v">${fmt(cmd.y_vel)}</span> m/s<br>
+    theta  <span class="v">${fmt(cmd.theta_vel, 1)}</span> deg/s<br>
+    lift   <span class="v">${cmd.lift}</span> (h=${lift.toFixed(2)})<br>
+    pos    (${fmt(car.x, 2)}, ${fmt(car.y, 2)}) m<br>
+    head   ${headingDeg.toFixed(1)}°<br>
+    ${stale ? '<span class="s">STALE — pedal_teleop not sending</span>' : ""}
+  `;
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

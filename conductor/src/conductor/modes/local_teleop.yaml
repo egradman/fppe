@@ -1,0 +1,20 @@
+# local_teleop — hand the base (omniwheel + lift) to a local joystick.
+#
+# The joystick is read by the web-UI gamepad pump (browser Gamepad API ->
+# POST /gamepad); viser_control drives wheels+lift when base_input_source ==
+# "gamepad", teleop_mode is local/remote, and the pump is fresh (enabled +
+# <300ms). This mode owns the SWITCH: it selects the gamepad source, holds the
+# arms steady, and holds. Leaving it (idle / e-stop) sets the source back to off,
+# and process_gamepad coasts the base to a stop on the edge. Base-only — arms are
+# not driven by the joystick.
+#
+# Requires the browser gamepad pump to be running with "Gamepad enabled" checked
+# (a controller connected to the machine viewing fppe:8091).
+type: sequence
+name: local_teleop
+memory: true
+children:
+  - { type: set_teleop_mode, params: { mode: "local" } }
+  - { type: lock_arm, params: { side: "both", lock: true } }
+  - { type: set_base_source, params: { value: "gamepad" } }
+  - { type: hold, name: "joystick_active" }

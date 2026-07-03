@@ -1,0 +1,28 @@
+# chase_dogs — search for a dog with the camera and chase it.
+#
+# Setup runs once (track 'dog', hand the base to the conductor), then a reactive
+# selector holds forever: pursue the dog if visible, otherwise sweep to search.
+# The memory:false selector re-decides every tick, so a dog appearing mid-search
+# instantly preempts the search (which zeroes its spin) and switches to chase.
+#
+# On hardware this needs the Phase-3 'auto' base_input_source + UDP listener and
+# a real detector wired into PerceptionClient. Without them, set_base_source
+# 'auto' is rejected by the Pi and the mission fails safe to idle; with the base
+# listener but no detector, it simply searches (spins) forever.
+type: sequence
+name: chase_dogs
+memory: true
+children:
+  - { type: start_perception, params: { target: dog } }
+  - { type: set_base_source, params: { value: auto } }
+  - type: selector
+    name: chase_or_search
+    memory: false
+    children:
+      - type: sequence
+        name: pursue
+        memory: false
+        children:
+          - { type: object_visible, params: { target: dog, min_conf: 0.4 } }
+          - { type: chase, params: { target: dog, standoff: 0.15 } }
+      - { type: search_pattern, params: { spin_degps: 30 } }
