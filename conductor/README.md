@@ -24,10 +24,23 @@ just conductor list            # available modes
 just conductor show teleop     # render a mode's tree (no hardware)
 just conductor catalog         # the LLM-facing behavior catalog (JSON)
 just conductor run teleop      # tick the engine against a live fppe Pi
+just conductor serve           # run as a persistent HTTP service on :8100
 ```
 
-`run` expects `viser_control.py` up on the Pi (`just viser`). Ctrl-C returns to
-`idle` and stops all senders.
+`run`/`serve` expect `viser_control.py` up on the Pi (`just viser`). Ctrl-C returns
+to `idle` and stops all senders.
+
+## HTTP service — the single owner of mode switching
+
+`conductor serve` runs the engine as a persistent service (stdlib http.server,
+CORS-open) so that **the behavior tree owns mode switching** — the web UI, the voice
+LLM, and `curl` ask the conductor for a change instead of poking `viser_control`'s
+enums directly. Endpoints (default `:8100`): `GET /status|/modes|/catalog`,
+`POST /mission|/mission/dsl|/interrupt|/preset|/abort`. `/interrupt` and `/preset`
+run an activity now and **auto-restore** the prior mode when it succeeds (resume
+stack); `/preset` backs the voice `move_arms` tool. The web UI's mode selector polls
+`/status` and POSTs `/mission`. See the top-level [ARCHITECTURE.md](../ARCHITECTURE.md)
+for the full endpoint table and how this composes with vision + voice.
 
 ## Layout
 
@@ -58,7 +71,9 @@ just conductor run teleop      # tick the engine against a live fppe Pi
 
 ## Status & roadmap
 
-**Real:** `idle`, `teleop`. **Stub (wired, honest FAILURE):** `nav`, `clean_room`.
+**Real:** `idle`, `teleop`, `local_teleop` (base driven by the local joystick via
+the browser gamepad pump). **Reactive (offline-tested):** `chase_dogs`.
+**Stub (wired, honest FAILURE):** `nav`, `clean_room`.
 
 - **Phase 3 — nav:** add a `"nav"` value to `viser_control` `BaseInputSource._VALUES`
   + a `start_nav_udp_listener` mirroring `start_pedal_udp_listener`, and a nav sender

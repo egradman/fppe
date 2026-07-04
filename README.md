@@ -10,6 +10,10 @@ Compared to the original lerobot, lerobot_alohamini significantly enhances debug
 For newly added debugging commands, please refer to:
 [Debug Command Summary](examples/debug/README.md)
 
+For the **fppe** robot's brain-side orchestration/perception/voice layer (the
+conductor behavior tree, the Moondream vision service, and the voice LLM tooling),
+see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 AlohaMini Hardware 
 ![alohamini concept](examples/alohamini/media/alohamini3a.png)  
 
