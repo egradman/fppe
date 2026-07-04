@@ -181,6 +181,27 @@ def body_to_wheel_raw(x_cmd: float, y_cmd: float, theta_cmd_degps: float) -> dic
     return {WHEEL_NAMES[0]: raw[0], WHEEL_NAMES[1]: raw[1], WHEEL_NAMES[2]: raw[2]}
 
 
+# Forward kinematics for dead-reckoning: the inverse of body_to_wheel_raw. Given
+# per-wheel raw *position* deltas since the last sample (ticks, 4096/rev), recover
+# the incremental body-frame displacement. Used by the tour recorder to integrate
+# an odometry estimate from the wheel encoders — fppe has no other odometry, but
+# the LeKiwi omni wheels slip little enough that dead-reckoning is good locally.
+_DR_ANGLES = np.radians(np.array([240, 0, 120]) - 90)
+_DR_M = np.array([[np.cos(a), np.sin(a), BASE_RADIUS] for a in _DR_ANGLES])
+
+
+def wheel_raw_delta_to_body(deltas: dict[str, float]) -> tuple[float, float, float]:
+    """Per-wheel raw tick deltas -> incremental body displacement (dx_m, dy_m, dtheta_rad).
+
+    Inverse of body_to_wheel_raw: ticks -> wheel angular displacement (rad) ->
+    linear displacement at each wheel contact (m) -> solve M @ [-dx, -dy, dtheta].
+    """
+    w_rad = np.array([deltas[n] for n in WHEEL_NAMES]) * (2.0 * math.pi / 4096.0)
+    v_lin = w_rad * WHEEL_RADIUS
+    body = np.linalg.solve(_DR_M, v_lin)  # [-dx, -dy, dtheta]
+    return -float(body[0]), -float(body[1]), float(body[2])
+
+
 
 # Module-level lock around the Feetech bus. Acquired by _bus_write internally
 # and explicitly wrapped around any direct bus.sync_read/sync_write call so the
@@ -441,6 +462,7 @@ class APIHandler(BaseHTTPRequestHandler):
     gamepad_state: "GamepadState"
     teleop_mode: "TeleopMode"
     base_input_source: "BaseInputSource"
+    tour_recorder: "TourRecorder | None"
 
     def _json_response(self, code: int, data: dict):
         body = json.dumps(data).encode()
@@ -510,6 +532,8 @@ class APIHandler(BaseHTTPRequestHandler):
             snap = self.robot_state.snapshot()
             snap["teleop_mode"] = self.teleop_mode.mode
             snap["base_input_source"] = self.base_input_source.value
+            if self.tour_recorder is not None:
+                snap["record"] = self.tour_recorder.status()
             self._json_response(200, snap)
         elif self.path.startswith("/mjpeg/"):
             label = self.path.split("/mjpeg/", 1)[1]
@@ -621,6 +645,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 200, {"ok": True, "value": self.base_input_source.value}
             )
 
+        elif self.path in ("/record/start", "/record/stop", "/record/label"):
+            if self.tour_recorder is None:
+                self._json_response(503, {"error": "recorder unavailable (no nav cam)"})
+                return
+            if self.path == "/record/start":
+                result = self.tour_recorder.start(body.get("name"))
+            elif self.path == "/record/stop":
+                result = self.tour_recorder.stop()
+            else:  # /record/label
+                result = self.tour_recorder.add_label(body.get("label", ""))
+            self._json_response(200 if result.get("ok") else 400, result)
+
         else:
             self.send_error(404)
 
@@ -643,6 +679,7 @@ def start_api_server(
     gamepad_state: GamepadState,
     teleop_mode: TeleopMode,
     base_input_source: BaseInputSource,
+    tour_recorder: "TourRecorder | None" = None,
 ):
     APIHandler.robot_state = robot_state
     APIHandler.cmd_queue = cmd_queue
@@ -650,6 +687,7 @@ def start_api_server(
     APIHandler.gamepad_state = gamepad_state
     APIHandler.teleop_mode = teleop_mode
     APIHandler.base_input_source = base_input_source
+    APIHandler.tour_recorder = tour_recorder
     httpd = ThreadingHTTPServer(("0.0.0.0", port), APIHandler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -814,10 +852,17 @@ def start_base_udp_listener(
                         state["last_warn"] = now
                     continue
 
-                if state["last_seq"] is not None and pedal_wire.seq_lt(
-                    pkt.seq, state["last_seq"]
-                ):
-                    continue
+                # Drop duplicate / minor-reordered datagrams, but tolerate a
+                # SENDER RESTART. When the conductor (or pedal sender) restarts,
+                # its seq counter resets to ~0, which looks "older" than our
+                # last_seq — the naive seq_lt check would then drop every packet
+                # forever and the wheels would silently never move. So only skip a
+                # *small* backward gap (genuine reordering); a large backward jump
+                # means a fresh sender, so resync to it.
+                if state["last_seq"] is not None:
+                    behind = (state["last_seq"] - pkt.seq) & 0xFFFFFFFF
+                    if 0 < behind < 256:
+                        continue  # stale / reordered within the live stream
                 state["last_seq"] = pkt.seq
                 state["last_fresh"] = now
 
@@ -880,6 +925,193 @@ def start_base_udp_listener(
     t.start()
     print(f"{log} listener: 0.0.0.0:{port}  (source='{source_name}')")
     return sock, t
+
+
+class TourRecorder:
+    """Records a teleop 'tour' to disk for the topological nav map (Phase 3).
+
+    While active, a background thread samples the wheel encoders, integrates a
+    dead-reckoned pose (inverse of body_to_wheel_raw), grabs the latest full-res
+    nav-cam frame, and writes both to a session directory at ~`rate_hz`. Label
+    buttons in the web UI POST /record/label at a *stop*, tagging the current
+    frame as a named goal node ('inward' / 'outward' for the garage test, the 14
+    rooms for the house). Storage lives on the Pi; the session is rsync'd to
+    skynet afterward where the offline builder subsamples it into a route.
+
+    Layout:  <root>/<name>/
+      meta.json      session info (name, cam, resolution, counts)
+      frames.jsonl   one row per captured frame: {i, t, x, y, heading, file}
+      labels.jsonl   label events: {t, label, frame_i}
+      frames/000001.jpg ...
+    """
+
+    def __init__(self, bus, frame_getter, root: Path, cam_label: str, rate_hz: float = 5.0):
+        self._bus = bus
+        self._frame_getter = frame_getter  # () -> np.ndarray | None (full-res latest)
+        self._root = root
+        self._cam_label = cam_label
+        self._period = 1.0 / rate_hz
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._active = False
+        self._name: str | None = None
+        self._dir: Path | None = None
+        self._frames_dir: Path | None = None
+        self._frames_fp = None
+        self._labels_fp = None
+        self._n_frames = 0
+        self._labels: list[dict] = []
+        # dead-reckoned pose (world frame, meters / radians) and last encoder read
+        self._x = 0.0
+        self._y = 0.0
+        self._heading = 0.0
+        self._last_raw: dict[str, float] | None = None
+
+    def _read_wheels(self) -> dict[str, float] | None:
+        try:
+            with _BUS_LOCK:
+                return self._bus.sync_read("Present_Position", list(WHEEL_NAMES), normalize=False)
+        except Exception:
+            return None
+
+    def start(self, name: str | None = None) -> dict:
+        with self._lock:
+            if self._active:
+                return {"ok": False, "error": "already recording", **self._status_locked()}
+            name = (name or time.strftime("tour_%Y%m%d_%H%M%S")).strip().replace("/", "_")
+            sdir = self._root / name
+            frames_dir = sdir / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            self._name = name
+            self._dir = sdir
+            self._frames_dir = frames_dir
+            self._frames_fp = (sdir / "frames.jsonl").open("w")
+            self._labels_fp = (sdir / "labels.jsonl").open("w")
+            self._n_frames = 0
+            self._labels = []
+            self._x = self._y = self._heading = 0.0
+            self._last_raw = self._read_wheels()  # seed so first delta ~0
+            (sdir / "meta.json").write_text(json.dumps({
+                "name": name,
+                "cam": self._cam_label,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }, indent=2))
+            self._active = True
+            self._thread = threading.Thread(target=self._run, daemon=True, name="tour-rec")
+            self._thread.start()
+            print(f"Tour recorder: started '{name}' -> {sdir}")
+            return {"ok": True, **self._status_locked()}
+
+    def stop(self) -> dict:
+        with self._lock:
+            if not self._active:
+                return {"ok": False, "error": "not recording", **self._status_locked()}
+            self._active = False
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2)
+        with self._lock:
+            summary = self._status_locked()
+            # finalize meta with counts
+            if self._dir is not None:
+                (self._dir / "meta.json").write_text(json.dumps({
+                    "name": self._name,
+                    "cam": self._cam_label,
+                    "n_frames": self._n_frames,
+                    "labels": self._labels,
+                    "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }, indent=2))
+            for fp in (self._frames_fp, self._labels_fp):
+                try:
+                    if fp is not None:
+                        fp.close()
+                except Exception:
+                    pass
+            self._frames_fp = self._labels_fp = None
+            print(f"Tour recorder: stopped '{self._name}' ({self._n_frames} frames, "
+                  f"{len(self._labels)} labels)")
+            return {"ok": True, **summary}
+
+    def add_label(self, label: str) -> dict:
+        label = (label or "").strip()
+        with self._lock:
+            if not self._active:
+                return {"ok": False, "error": "not recording"}
+            if not label:
+                return {"ok": False, "error": "empty label"}
+            # Attach to the frame most recently written (the operator is stopped).
+            evt = {"t": time.time(), "label": label, "frame_i": max(self._n_frames - 1, 0)}
+            self._labels.append(evt)
+            if self._labels_fp is not None:
+                self._labels_fp.write(json.dumps(evt) + "\n")
+                self._labels_fp.flush()
+            print(f"Tour recorder: label '{label}' @ frame {evt['frame_i']}")
+            return {"ok": True, "label": label, "frame_i": evt["frame_i"]}
+
+    def _run(self):
+        next_t = time.monotonic()
+        while True:
+            with self._lock:
+                if not self._active:
+                    return
+            self._tick()
+            next_t += self._period
+            slack = next_t - time.monotonic()
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                next_t = time.monotonic()
+
+    def _tick(self):
+        # 1) integrate dead-reckoned pose from wheel encoder deltas
+        cur = self._read_wheels()
+        if cur is not None and self._last_raw is not None:
+            deltas = {}
+            for n in WHEEL_NAMES:
+                d = (cur[n] - self._last_raw[n] + 2048) % 4096 - 2048  # unwrap, signed
+                deltas[n] = d
+            dx, dy, dth = wheel_raw_delta_to_body(deltas)
+            c, s = math.cos(self._heading), math.sin(self._heading)
+            self._x += dx * c - dy * s
+            self._y += dx * s + dy * c
+            self._heading += dth
+        if cur is not None:
+            self._last_raw = cur
+
+        # 2) capture the latest full-res nav-cam frame
+        frame = self._frame_getter()
+        if frame is None:
+            return
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            return
+        with self._lock:
+            if not self._active or self._frames_dir is None:
+                return
+            i = self._n_frames
+            fname = f"{i:06d}.jpg"
+            (self._frames_dir / fname).write_bytes(jpg.tobytes())
+            row = {"i": i, "t": time.time(), "x": round(self._x, 4),
+                   "y": round(self._y, 4), "heading": round(self._heading, 4),
+                   "file": f"frames/{fname}"}
+            if self._frames_fp is not None:
+                self._frames_fp.write(json.dumps(row) + "\n")
+            self._n_frames += 1
+
+    def _status_locked(self) -> dict:
+        return {
+            "active": self._active,
+            "name": self._name,
+            "n_frames": self._n_frames,
+            "x": round(self._x, 3),
+            "y": round(self._y, 3),
+            "heading_deg": round(math.degrees(self._heading), 1),
+            "labels": list(self._labels),
+        }
+
+    def status(self) -> dict:
+        with self._lock:
+            return self._status_locked()
 
 
 def start_voice_thread(
@@ -985,6 +1217,16 @@ def main():
     )
     parser.add_argument("--cam-width", type=int, default=640)
     parser.add_argument("--cam-height", type=int, default=480)
+    parser.add_argument(
+        "--nav-cam",
+        default="cam2",
+        help="Camera label the tour recorder captures (nav/fisheye cam)",
+    )
+    parser.add_argument(
+        "--tours-dir",
+        default=str(Path.home() / "tours"),
+        help="Where the tour recorder writes session dirs (on the Pi)",
+    )
     parser.add_argument(
         "--estop-gpio",
         type=int,
@@ -1343,6 +1585,23 @@ def main():
 
     # ---- HTTP API (started after the GUI build so port 8091 only opens
     # once viser's tab tree is ready; the kiosk autostart waits on 8091) ----
+    # ---- Tour recorder (teleop -> topological-nav map; Phase 3) ----
+    # Captures the nav cam + dead-reckoned pose while driving; label buttons in
+    # the web UI tag stops. Only available when the nav cam opened and the wheels
+    # are present (encoders back the dead-reckoning).
+    tour_recorder = None
+    nav_cam = cameras.get(args.nav_cam)
+    if nav_cam is not None and wheels_ready:
+        tour_recorder = TourRecorder(
+            bus,
+            frame_getter=lambda r=nav_cam: r.latest,
+            root=Path(args.tours_dir),
+            cam_label=args.nav_cam,
+        )
+        print(f"Tour recorder: ready (cam '{args.nav_cam}', -> {args.tours_dir})")
+    else:
+        print(f"Tour recorder: disabled (nav cam '{args.nav_cam}' or wheels unavailable)")
+
     start_api_server(
         args.api_port,
         robot_state,
@@ -1351,6 +1610,7 @@ def main():
         gamepad_state,
         teleop_mode,
         base_input_source,
+        tour_recorder=tour_recorder,
     )
 
     # ---- Leader UDP listener (skynet -> fppe joint-angle stream) ----
