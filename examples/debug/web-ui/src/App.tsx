@@ -19,7 +19,7 @@ const GAMEPAD_DEADZONE = 0.1;
 const applyDeadzone = (vals: number[]): number[] =>
   vals.map((v) => (Math.abs(v) < GAMEPAD_DEADZONE ? 0 : v));
 
-type Tab = "controls" | "local-teleop" | "remote-teleop" | "cam0" | "cam1" | "face";
+type Tab = "controls" | "local-teleop" | "remote-teleop" | "cam0" | "cam1" | "cam2" | "face";
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("face");
@@ -34,6 +34,7 @@ function App() {
     { id: "remote-teleop", label: "Remote Teleop" },
     { id: "cam0", label: "Camera 0" },
     { id: "cam1", label: "Camera 1" },
+    { id: "cam2", label: "Fisheye" },
     { id: "face", label: "Face" },
   ];
 
@@ -87,6 +88,13 @@ function App() {
             src={`${API_BASE}/mjpeg/cam1`}
             className="full-frame camera-feed"
             alt="Camera 1"
+          />
+        )}
+        {activeTab === "cam2" && (
+          <img
+            src={`${API_BASE}/mjpeg/cam2`}
+            className="full-frame camera-feed"
+            alt="Fisheye nav cam"
           />
         )}
       </div>

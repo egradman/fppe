@@ -942,6 +942,11 @@ def main():
     )
     parser.add_argument("--cam0", default="/dev/video0", help="First camera device")
     parser.add_argument("--cam1", default="/dev/video2", help="Second camera device")
+    parser.add_argument(
+        "--cam2",
+        default="/dev/video4",
+        help="Third camera device (fisheye nav cam; empty string disables)",
+    )
     parser.add_argument("--cam-width", type=int, default=640)
     parser.add_argument("--cam-height", type=int, default=480)
     parser.add_argument(
@@ -1110,7 +1115,10 @@ def main():
             self._thread.join(timeout=2)
 
     cameras: dict[str, CameraReader] = {}
-    for label, dev in [("cam0", args.cam0), ("cam1", args.cam1)]:
+    cam_devs = [("cam0", args.cam0), ("cam1", args.cam1)]
+    if args.cam2:  # fisheye nav cam; optional so a missing device is silent
+        cam_devs.append(("cam2", args.cam2))
+    for label, dev in cam_devs:
         reader = CameraReader(dev, args.cam_width, args.cam_height)
         if reader.cap.isOpened():
             cameras[label] = reader
