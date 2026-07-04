@@ -18,7 +18,7 @@ HTTP API (on --api-port, default 8091):
   POST /lift                 — {"action": "up"|"down"|"stop"}
   POST /gamepad              — {"axes": [...], "buttons": [bool, ...], "enabled": bool}
   POST /teleop_mode          — {"mode": "local"|"remote"} — see TeleopMode
-  POST /base_input_source    — {"value": "off"|"gamepad"|"pedals"|"nav"} — see BaseInputSource
+  POST /base_input_source    — {"value": "off"|"gamepad"|"pedals"|"auto"} — see BaseInputSource
 
 The /state response includes "estop_engaged" (bool) read from a Raspberry Pi
 GPIO pin (default GPIO19). The e-stop is inline with motor power, so when
@@ -381,15 +381,15 @@ class BaseInputSource:
     'gamepad' — the web gamepad's axes/buttons drive wheels + lift.
     'pedals'  — UDP packets from the skynet-side pedal_teleop drive wheels +
                 lift. The web gamepad is silently dropped for the base.
-    'nav'     — UDP packets from the skynet-side nav executor (visual nav)
-                drive the wheels. Same PedalPacket wire format as 'pedals',
-                on its own port. The web gamepad is silently dropped.
+    'auto'    — UDP packets from a skynet-side autonomous driver (the conductor:
+                visual nav, chase, etc.) drive the wheels. Same PedalPacket wire
+                format as 'pedals', on its own port. The web gamepad is dropped.
 
     Disjoint from TeleopMode, which gates the arms. E-stop overrides both.
     Default is 'off' — explicit-enable for safety.
     """
 
-    _VALUES = ("off", "gamepad", "pedals", "nav")
+    _VALUES = ("off", "gamepad", "pedals", "auto")
 
     def __init__(self, initial: str = "off"):
         self._lock = threading.Lock()
@@ -605,12 +605,12 @@ class APIHandler(BaseHTTPRequestHandler):
             self._json_response(200, {"ok": True, "mode": self.teleop_mode.mode})
 
         elif self.path == "/base_input_source":
-            # {"value": "off"|"gamepad"|"pedals"|"nav"}
+            # {"value": "off"|"gamepad"|"pedals"|"auto"}
             value = body.get("value")
             if not self.base_input_source.set(value):
                 self._json_response(
                     400,
-                    {"error": "value must be 'off', 'gamepad', 'pedals', or 'nav'"},
+                    {"error": "value must be 'off', 'gamepad', 'pedals', or 'auto'"},
                 )
                 return
             # Any source change immediately halts the base + lift so the next
@@ -759,8 +759,8 @@ def start_base_udp_listener(
     """Receive PedalPacket-shaped base commands on `port` and drive the wheels
     (+ lift) whenever `base_input_source` currently equals `source_name`.
 
-    Used for both the pedal teleop stream ('pedals', :9998) and the visual-nav
-    executor stream ('nav', :9997) — identical wire format, disjoint ports, each
+    Used for both the pedal teleop stream ('pedals', :9998) and the autonomous
+    conductor stream ('auto', :9997) — identical wire format, disjoint ports, each
     gated on its own source value so exactly one owns the base at a time.
     """
     log = f"{source_name.capitalize()} UDP"
@@ -984,11 +984,11 @@ def main():
         help="UDP port to receive pedal-derived base commands from skynet. 0 disables.",
     )
     parser.add_argument(
-        "--nav-udp-port",
+        "--auto-udp-port",
         type=int,
         default=9997,
-        help="UDP port to receive visual-nav base commands (PedalPacket wire) "
-        "from the skynet nav executor. 0 disables.",
+        help="UDP port to receive autonomous base commands (PedalPacket wire) "
+        "from the skynet conductor (visual nav, chase, etc.). 0 disables.",
     )
     parser.add_argument(
         "--voice",
@@ -1357,17 +1357,17 @@ def main():
             thread_name="pedal-udp",
         )
 
-    # ---- Nav UDP listener (skynet -> fppe visual-nav base stream) ----
-    if args.nav_udp_port > 0:
+    # ---- Auto UDP listener (skynet conductor -> fppe autonomous base stream) ----
+    if args.auto_udp_port > 0:
         start_base_udp_listener(
-            args.nav_udp_port,
+            args.auto_udp_port,
             bus,
             base_input_source=base_input_source,
             estop=estop,
             wheels_available=wheels_ready,
             cmd_queue=cmd_q,
-            source_name="nav",
-            thread_name="nav-udp",
+            source_name="auto",
+            thread_name="auto-udp",
         )
 
     # ---- Voice pipeline (mic/speaker <-> skynet speech server + Face tab) ----

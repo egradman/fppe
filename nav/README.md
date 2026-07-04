@@ -4,8 +4,8 @@ Language-instruction navigation over a pre-recorded map, built on the open
 GNM/ViNT/NoMaD policies (`robodhruv/visualnav-transformer`, MIT). LM-Nav-style:
 a topological graph of camera frames + CLIP landmark grounding + an LLM to parse
 instructions. Inference runs here on skynet's GPU; body-velocity commands stream
-to the fppe Pi over UDP (a future `base_input_source == "nav"`), mirroring
-`leader_teleop` / `pedal_teleop`.
+to the fppe Pi over UDP (`base_input_source == "auto"`, the shared autonomous-base
+source), mirroring `leader_teleop` / `pedal_teleop`.
 
 See `memory/project_nav_stack.md` for the full plan and rationale, and `PLAN.md`
 for Phases 2→6.
@@ -16,11 +16,12 @@ Phase 1 (offline harness) is done. Phase 2 closes the loop on real hardware:
 read the live fisheye feed → ViNT → proportional controller → UDP → the fppe
 base. No graph/labels/language yet — a single hop toward a goal photo.
 
-- **fppe side (`viser_control.py`):** `base_input_source` gained a **`nav`** value
-  and a nav UDP listener on **:9997** (same `PedalPacket` wire as pedals, own
-  port, own gate). Enable with the web UI's base-source control.
+- **fppe side (`viser_control.py`):** `base_input_source` gained an **`auto`** value
+  (the shared autonomous-base source — nav today, chase later) and an auto UDP
+  listener on **:9997** (same `PedalPacket` wire as pedals, own port, own gate).
 - **skynet side (this project):** `nav-drive` runs the control loop; `nav-snap`
-  grabs a goal photo off the fisheye.
+  grabs a goal photo off the fisheye. The real integration is the **conductor**
+  driving nav through its `ctx.base` channel to the same `auto` source.
 
 ## Setup
 
@@ -56,7 +57,7 @@ from skynet:
 # 1. capture a goal photo a few meters ahead (safe; no base movement)
 uv run nav-snap --out goal.jpg
 
-# 2. drive toward it. Set base_input_source='nav' in the web UI first,
+# 2. drive toward it. --arm sets base_input_source='auto' over HTTP,
 #    and KEEP A HAND ON THE PHYSICAL E-STOP for the first run.
 uv run nav-drive --goal goal.jpg --robot-host fppe
 ```

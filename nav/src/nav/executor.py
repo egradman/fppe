@@ -9,10 +9,13 @@ language. One hop:
   4. stream that velocity as a PedalPacket-shaped UDP datagram to viser_control,
   5. stop when ViNT's distance-to-goal drops below a threshold.
 
-Runs on skynet (GPU). The fppe Pi must have `viser_control.py` up with a nav UDP
-listener (`--nav-udp-port 9997`, on by default) and the operator must set
-`base_input_source` to "nav" (web UI) to actually let the wheels move. Keep a
-hand on the physical e-stop for the first base-moving run.
+Runs on skynet (GPU). The fppe Pi must have `viser_control.py` up with the auto
+UDP listener (`--auto-udp-port 9997`, on by default) and `base_input_source` set
+to "auto" (via `--arm`, the web UI, or the conductor) to let the wheels move.
+Keep a hand on the physical e-stop for the first base-moving run.
+
+Standalone (`--arm`) is for bench testing; the real integration is the conductor
+driving this through its `ctx.base` channel (see conductor/).
 
     uv run nav-drive --goal goal.jpg --robot-host fppe
     uv run nav-snap  --out goal.jpg           # grab a goal photo from the fisheye
@@ -114,10 +117,11 @@ def drive(args):
 
     sender = VelocitySender(args.robot_host, args.port, args.send_rate)
     if args.arm:
-        _set_base_source(args.robot_host, args.cam_port, "nav")
-        print("[nav] armed base_input_source=nav via HTTP")
+        _set_base_source(args.robot_host, args.cam_port, "auto")
+        print("[nav] armed base_input_source=auto via HTTP")
     else:
-        print("[nav] NOT armed — set base_input_source='nav' in the web UI to move.")
+        print("[nav] NOT armed — set base_input_source='auto' (or run under the "
+              "conductor) to move.")
     sender.start()
 
     print("[nav] waiting for camera warmup...")

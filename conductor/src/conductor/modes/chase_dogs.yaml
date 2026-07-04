@@ -5,10 +5,11 @@
 # The memory:false selector re-decides every tick, so a dog appearing mid-search
 # instantly preempts the search (which zeroes its spin) and switches to chase.
 #
-# On hardware this needs the Phase-3 'auto' base_input_source + UDP listener and
-# a real detector wired into PerceptionClient. Without them, set_base_source
-# 'auto' is rejected by the Pi and the mission fails safe to idle; with the base
-# listener but no detector, it simply searches (spins) forever.
+# The 'auto' base_input_source + UDP listener now EXIST on the Pi (shared with
+# nav). So loading this mode WILL drive the base: with no detector wired into
+# PerceptionClient yet, there are no sightings, so it falls to search_pattern and
+# spins in place forever. Opt-in only (default mode is idle) — but be aware it now
+# moves the robot. A real detector in PerceptionClient makes it actually chase.
 type: sequence
 name: chase_dogs
 memory: true

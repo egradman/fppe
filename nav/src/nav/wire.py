@@ -7,9 +7,10 @@ importing across uv projects — same convention leader_teleop / pedal_teleop
 already follow. The JSON schema is the contract, not the Python class.
 
 Transport: UDP datagrams of JSON on port 9997 (pedals are on 9998). The fppe
-receiver only acts on packets while `base_input_source == "nav"`, and a 300 ms
-wheel watchdog stops the base if the stream stalls — so a crashed executor
-coasts to a halt on its own.
+receiver only acts on packets while `base_input_source == "auto"` (the shared
+autonomous-base source; the conductor's BaseCmdChannel targets the same port),
+and a 300 ms wheel watchdog stops the base if the stream stalls — so a crashed
+executor coasts to a halt on its own.
 """
 
 import json

@@ -28,7 +28,7 @@ class EstopClear(RobotBehaviour):
 @register(
     "source_is",
     "SUCCESS when base_input_source equals the given value.",
-    {"value": {"type": "string", "enum": ["off", "gamepad", "pedals"], "description": "expected source"}},
+    {"value": {"type": "string", "enum": ["off", "gamepad", "pedals", "auto"], "description": "expected source"}},
 )
 class SourceIs(RobotBehaviour):
     def __init__(self, ctx: Context, value: str, name: str | None = None):

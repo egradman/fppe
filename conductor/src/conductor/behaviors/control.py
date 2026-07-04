@@ -14,8 +14,8 @@ from conductor.registry import register
 @register(
     "set_base_source",
     "Select which source drives the base (wheels + lift). Confirms via /state.",
-    {"value": {"type": "string", "enum": ["off", "gamepad", "pedals"],
-               "description": "base_input_source to switch to"}},
+    {"value": {"type": "string", "enum": ["off", "gamepad", "pedals", "auto"],
+               "description": "base_input_source to switch to ('auto' = conductor-driven)"}},
 )
 class SetBaseSource(ConfirmBehaviour):
     def __init__(self, ctx: Context, value: str, name: str | None = None):
