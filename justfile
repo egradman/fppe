@@ -62,3 +62,8 @@ pedal-teleop *args:
 # e.g. `just conductor run teleop`, `just conductor show teleop`, `just conductor catalog`
 conductor *args:
     cd conductor && uv run conductor {{args}}
+
+# Local (skynet) — scene-description service (Moondream2) backing the voice `look` tool.
+# e.g. `just vision serve --preload`, `just vision look "what do you see?"`
+vision *args:
+    cd vision && uv run vision {{args}}

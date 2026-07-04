@@ -102,6 +102,14 @@ class ListenAndPlayRealtimeArguments:
         default=8100,
         metadata={"help": "Port of the conductor HTTP API. Set to 0 to disable robot tools."},
     )
+    vision_host: str = field(
+        default="skynet",
+        metadata={"help": "Host of the vision scene-description service (the 'look' tool)."},
+    )
+    vision_port: int = field(
+        default=8102,
+        metadata={"help": "Port of the vision service. Set to 0 to disable the look tool."},
+    )
 
 
 # Tools the realtime model can call to drive the robot. Both go through the
@@ -111,11 +119,73 @@ class ListenAndPlayRealtimeArguments:
 DEFAULT_MODES = ["idle", "teleop", "local_teleop", "nav", "clean_room", "chase_dogs"]
 PRESETS = ["home", "middle", "arms_up"]
 
+# Tools whose *result* carries information the model must speak back (a read/query,
+# not a fire-and-forget action). For these we always follow up with a response so
+# the model verbalizes the tool output; write tools (set_mode/move_arms) only
+# follow up on failure, since their success is acknowledged inline (see the
+# collision note in handle_tool_call).
+READ_TOOLS = {"look"}
+
 
 def _conductor_base(args: "ListenAndPlayRealtimeArguments") -> Optional[str]:
     if not args.conductor_port:
         return None
     return f"http://{args.conductor_host}:{args.conductor_port}"
+
+
+def _vision_base(args: "ListenAndPlayRealtimeArguments") -> Optional[str]:
+    if not args.vision_port:
+        return None
+    return f"http://{args.vision_host}:{args.vision_port}"
+
+
+def _vision_look(base: str, question: str = "", cam: str = "") -> dict:
+    """Blocking GET to the vision service's /look (run via asyncio.to_thread).
+    VLM inference can take a few seconds (CPU fallback), so allow a long timeout."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    params = {}
+    if question:
+        params["q"] = question
+    if cam:
+        params["cam"] = cam
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    req = urllib.request.Request(f"{base}/look{query}", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            return {"ok": False, "error": f"HTTP {exc.code}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _look_tool_spec() -> dict:
+    return {
+        "type": "function",
+        "name": "look",
+        "description": (
+            "Look through the robot's camera and describe what it currently sees. "
+            "Call this whenever the user asks what you see, what's in front of you, "
+            "to find or count something, or any question about the physical scene. "
+            "Pass a specific 'question' to ask about the scene; omit it for a general "
+            "description. Returns text you should read back to the user."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "Optional specific question about the scene, e.g. 'is anyone holding a mug?'",
+                }
+            },
+        },
+    }
 
 
 def _conductor_call(base: str, path: str, payload: Optional[dict] = None) -> dict:
@@ -245,6 +315,7 @@ async def listen_and_play_realtime(
     client = _make_client(args)
 
     conductor_base = _conductor_base(args)
+    vision_base = _vision_base(args)
 
     mic_queue: Queue[bytes] = Queue(maxsize=128)
     # When embedded in another process (e.g. viser_control forks this on a
@@ -398,12 +469,22 @@ async def listen_and_play_realtime(
     def run_tool(name: str, arguments: str) -> dict:
         """Execute one tool call against the conductor. Blocking; call via
         asyncio.to_thread. Returns a small dict fed back to the model."""
-        if conductor_base is None:
-            return {"ok": False, "error": "robot control is offline"}
         try:
             call_args = json.loads(arguments) if arguments else {}
         except Exception:
             return {"ok": False, "error": "could not parse tool arguments"}
+
+        if name == "look":
+            if vision_base is None:
+                return {"ok": False, "error": "vision is offline"}
+            question = (call_args.get("question") or "").strip()
+            res = _vision_look(vision_base, question)
+            if res.get("ok"):
+                return {"ok": True, "description": res.get("text", "")}
+            return {"ok": False, "error": res.get("error", "look failed")}
+
+        if conductor_base is None:
+            return {"ok": False, "error": "robot control is offline"}
 
         if name == "set_mode":
             mode = call_args.get("mode")
@@ -432,11 +513,14 @@ async def listen_and_play_realtime(
                 "output": json.dumps(result),
             },
         })
-        # On success the model already acknowledged inline in the same response;
-        # a second response.create would double-speak AND collide with the still-
-        # open response. Only speak again to report a FAILURE, and defer it until
-        # the active response completes (flushed in the response.done handler).
-        if not result.get("ok", False):
+        # Write tools (set_mode/move_arms): the model already acknowledged inline
+        # in the same response, so a second response.create would double-speak AND
+        # collide with the still-open response — only follow up to report a FAILURE.
+        # Read tools (look): the result IS the payload the model must speak, so
+        # always follow up. Either way, defer until the active response closes
+        # (flushed in the response.done handler) to avoid the collision.
+        needs_followup = (name in READ_TOOLS) or (not result.get("ok", False))
+        if needs_followup:
             if response_active[0]:
                 pending_followup[0] = True
             else:
@@ -591,7 +675,7 @@ async def listen_and_play_realtime(
         face_server = await websockets.serve(face_handler, args.face_host, args.face_port)
         print(f"Face WS on ws://{args.face_host}:{args.face_port}", flush=True)
 
-    tools = None
+    tools: list[dict] = []
     if conductor_base is not None:
         modes = DEFAULT_MODES
         status = await asyncio.to_thread(_conductor_call, conductor_base, "/modes", None)
@@ -599,8 +683,12 @@ async def listen_and_play_realtime(
             modes = status["modes"]
         else:
             print(f"Conductor {conductor_base} unreachable; tools use default modes.", flush=True)
-        tools = _tool_specs(modes)
+        tools += _tool_specs(modes)
         print(f"Robot tools enabled ({conductor_base}); modes={modes}", flush=True)
+    if vision_base is not None:
+        tools.append(_look_tool_spec())
+        print(f"Vision 'look' tool enabled ({vision_base}).", flush=True)
+    tools = tools or None
 
     try:
         async with client.realtime.connect(model=args.model) as conn:
@@ -671,6 +759,10 @@ def main() -> None:
                         help="Conductor behavior-tree API host (mode/preset tools).")
     parser.add_argument("--conductor-port", type=int, default=defaults.conductor_port,
                         help="Conductor API port. Set to 0 to disable robot tools.")
+    parser.add_argument("--vision-host", default=defaults.vision_host,
+                        help="Vision scene-description service host (the 'look' tool).")
+    parser.add_argument("--vision-port", type=int, default=defaults.vision_port,
+                        help="Vision service port. Set to 0 to disable the look tool.")
     namespace = parser.parse_args()
     args = ListenAndPlayRealtimeArguments(
         host=namespace.host,
@@ -693,6 +785,8 @@ def main() -> None:
         face_rate=namespace.face_rate,
         conductor_host=namespace.conductor_host,
         conductor_port=namespace.conductor_port,
+        vision_host=namespace.vision_host,
+        vision_port=namespace.vision_port,
     )
     try:
         asyncio.run(listen_and_play_realtime(args))

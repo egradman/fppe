@@ -1,0 +1,15 @@
+[Unit]
+Description=fppe scene-description service (Moondream2 VLM) backing the voice `look` tool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vision-server.sh
+Restart=on-failure
+RestartSec=10
+# First run downloads Moondream weights; load + CUDA warmup adds a bit more.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
