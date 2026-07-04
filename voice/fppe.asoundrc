@@ -1,0 +1,35 @@
+# fppe Pi ALSA config — install as /etc/asound.conf on the Pi:
+#   sudo cp voice/fppe.asoundrc /etc/asound.conf
+# (system-wide + persistent; not tied to $HOME).
+#
+# Routes the ALSA default to the Jabra SPEAK 410 USB speakerphone (card 2) with
+# the conversions the voice pipeline needs:
+#
+#   - Playback: the Jabra hardware ALWAYS clocks at 48 kHz even though it claims
+#     to "support" 8k-48k, so opening it at 16 kHz plays ~3x too fast. We pin the
+#     playback slave to 48000/stereo so ALSA resamples our 16 kHz mono TTS up to
+#     the device's true rate (verified: a 3s 16k tone plays in 3.0s, not 1.0s).
+#   - Capture: the mic is genuinely 16 kHz mono, so it passes straight through.
+#
+# viser_control.py --voice (and the standalone client) open the default device,
+# so this is what makes Purple's voice sound correct on the robot.
+pcm.!default {
+    type asym
+    playback.pcm {
+        type plug
+        slave {
+            pcm "hw:2,0"
+            rate 48000
+            channels 2
+        }
+    }
+    capture.pcm {
+        type plug
+        slave.pcm "hw:2,0"
+    }
+}
+
+ctl.!default {
+    type hw
+    card 2
+}

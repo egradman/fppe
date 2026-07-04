@@ -14,6 +14,8 @@ handlers mutate it through its thread-safe load_mission/abort). Dependency-free
   GET  /catalog        -> the behavior catalog (leaves + composites)
   POST /mission        {name}          -> load a named mode
   POST /mission/dsl    {name?, dsl}    -> load an arbitrary tree (LLM/custom)
+  POST /interrupt      {name?, dsl}    -> run dsl now, resume current mode after
+  POST /preset         {preset}        -> move arms to a posture, then resume
   POST /abort                          -> drop to idle
 """
 
@@ -29,6 +31,21 @@ from conductor.modes import list_modes, load_mode
 from conductor.registry import catalog
 
 log = logging.getLogger(__name__)
+
+PRESETS = ("home", "middle", "arms_up")
+
+
+def _preset_dsl(preset: str) -> dict:
+    """A transient arm-posture activity: command the posture, wait for the
+    motors to settle, then SUCCESS (so the Engine's resume stack restores the
+    mode that was running before the interrupt)."""
+    return {
+        "type": "sequence", "name": f"preset_{preset}", "memory": True,
+        "children": [
+            {"type": "go_preset", "params": {"preset": preset}},
+            {"type": "wait_settled"},
+        ],
+    }
 
 
 class ConductorHandler(BaseHTTPRequestHandler):
@@ -114,6 +131,25 @@ class ConductorHandler(BaseHTTPRequestHandler):
             eng.load_mission(name, dsl)
             log.info("HTTP -> load_mission(%s, <dsl>)", name)
             self._json(200, {"ok": True, "mission": name})
+
+        elif self.path == "/interrupt":
+            name = body.get("name", "interrupt")
+            dsl = body.get("dsl")
+            if not isinstance(dsl, dict):
+                self._json(400, {"error": "'dsl' must be a tree object"})
+                return
+            eng.interrupt(name, dsl)
+            log.info("HTTP -> interrupt(%s)", name)
+            self._json(200, {"ok": True, "mission": name, "resumes": eng.current_mission()})
+
+        elif self.path == "/preset":
+            preset = body.get("preset")
+            if preset not in PRESETS:
+                self._json(400, {"error": f"unknown preset {preset!r}", "presets": list(PRESETS)})
+                return
+            eng.interrupt(f"preset_{preset}", _preset_dsl(preset))
+            log.info("HTTP -> preset(%s)", preset)
+            self._json(200, {"ok": True, "preset": preset, "resumes": eng.current_mission()})
 
         elif self.path == "/abort":
             eng.abort()

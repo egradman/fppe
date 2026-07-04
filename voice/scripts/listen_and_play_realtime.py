@@ -94,6 +94,88 @@ class ListenAndPlayRealtimeArguments:
         default=30,
         metadata={"help": "Face mouth-envelope broadcast rate in Hz."},
     )
+    conductor_host: str = field(
+        default="skynet",
+        metadata={"help": "Host of the conductor behavior-tree HTTP API (mode/preset tools)."},
+    )
+    conductor_port: int = field(
+        default=8100,
+        metadata={"help": "Port of the conductor HTTP API. Set to 0 to disable robot tools."},
+    )
+
+
+# Tools the realtime model can call to drive the robot. Both go through the
+# conductor behavior tree (never the Pi directly) so the tree stays the single
+# owner of what the robot is doing. Modes are refreshed from GET /modes at
+# connect; this is the fallback if the conductor is unreachable then.
+DEFAULT_MODES = ["idle", "teleop", "local_teleop", "nav", "clean_room", "chase_dogs"]
+PRESETS = ["home", "middle", "arms_up"]
+
+
+def _conductor_base(args: "ListenAndPlayRealtimeArguments") -> Optional[str]:
+    if not args.conductor_port:
+        return None
+    return f"http://{args.conductor_host}:{args.conductor_port}"
+
+
+def _conductor_call(base: str, path: str, payload: Optional[dict] = None) -> dict:
+    """Blocking HTTP to the conductor (run via asyncio.to_thread). stdlib only."""
+    import urllib.error
+    import urllib.request
+
+    url = f"{base}{path}"
+    data = None
+    method = "GET"
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        method = "POST"
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            return {"error": f"HTTP {exc.code}"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _tool_specs(modes: list[str]) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "name": "set_mode",
+            "description": (
+                "Switch the robot's behavior mode. 'idle' stops and is safe; "
+                "'teleop' lets a remote operator drive the arms and base; "
+                "'local_teleop' lets the local joystick drive the base."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"mode": {"type": "string", "enum": modes}},
+                "required": ["mode"],
+            },
+        },
+        {
+            "type": "function",
+            "name": "move_arms",
+            "description": (
+                "Move both arms to a named posture, then return to whatever the "
+                "robot was doing. 'home' is the resting pose, 'middle' centers all "
+                "joints, 'arms_up' raises them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"preset": {"type": "string", "enum": PRESETS}},
+                "required": ["preset"],
+            },
+        },
+    ]
 
 
 def _make_client(args: ListenAndPlayRealtimeArguments) -> AsyncOpenAI:
@@ -106,7 +188,10 @@ def _make_client(args: ListenAndPlayRealtimeArguments) -> AsyncOpenAI:
     )
 
 
-def _build_session_update(args: ListenAndPlayRealtimeArguments) -> dict:
+def _build_session_update(
+    args: ListenAndPlayRealtimeArguments,
+    tools: Optional[list[dict]] = None,
+) -> dict:
     def maybe_pcm_format(rate: int) -> Optional[dict]:
         # The OpenAI realtime Pydantic models only validate audio/pcm at 24 kHz.
         # Our local pipeline defaults to 16 kHz internally when format is omitted,
@@ -144,6 +229,9 @@ def _build_session_update(args: ListenAndPlayRealtimeArguments) -> dict:
     }
     if args.instructions:
         session["instructions"] = args.instructions
+    if tools:
+        session["tools"] = tools
+        session["tool_choice"] = "auto"
     return {"type": "session.update", "session": session}
 
 
@@ -156,6 +244,8 @@ async def listen_and_play_realtime(
 
     client = _make_client(args)
 
+    conductor_base = _conductor_base(args)
+
     mic_queue: Queue[bytes] = Queue(maxsize=128)
     # When embedded in another process (e.g. viser_control forks this on a
     # worker thread), the caller passes its own Event to request shutdown.
@@ -167,6 +257,11 @@ async def listen_and_play_realtime(
     partial_user_text = ""
     live_user_width = 0
     saw_user_speech = False
+    # This server emits tool calls *inside* an open response (the model speaks its
+    # acknowledgement in the same turn), so a follow-up response.create must wait
+    # until that response finishes — else "conversation_already_has_active_response".
+    response_active = [False]
+    pending_followup = [False]
 
     loop = asyncio.get_running_loop()
     face_clients: set = set()
@@ -300,6 +395,53 @@ async def listen_and_play_realtime(
         except Exception:
             pass
 
+    def run_tool(name: str, arguments: str) -> dict:
+        """Execute one tool call against the conductor. Blocking; call via
+        asyncio.to_thread. Returns a small dict fed back to the model."""
+        if conductor_base is None:
+            return {"ok": False, "error": "robot control is offline"}
+        try:
+            call_args = json.loads(arguments) if arguments else {}
+        except Exception:
+            return {"ok": False, "error": "could not parse tool arguments"}
+
+        if name == "set_mode":
+            mode = call_args.get("mode")
+            res = _conductor_call(conductor_base, "/mission", {"name": mode})
+            if res.get("ok"):
+                return {"ok": True, "mode": res.get("mission", mode)}
+            return {"ok": False, "error": res.get("error", "mode switch failed")}
+
+        if name == "move_arms":
+            preset = call_args.get("preset")
+            res = _conductor_call(conductor_base, "/preset", {"preset": preset})
+            if res.get("ok"):
+                return {"ok": True, "preset": preset, "resuming": res.get("resumes")}
+            return {"ok": False, "error": res.get("error", "arm move failed")}
+
+        return {"ok": False, "error": f"unknown tool {name}"}
+
+    async def handle_tool_call(conn, name: str, call_id: str, arguments: str) -> None:
+        result = await asyncio.to_thread(run_tool, name, arguments)
+        print(f"TOOL RESULT: {name} -> {result}", flush=True)
+        await conn.send({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": json.dumps(result),
+            },
+        })
+        # On success the model already acknowledged inline in the same response;
+        # a second response.create would double-speak AND collide with the still-
+        # open response. Only speak again to report a FAILURE, and defer it until
+        # the active response completes (flushed in the response.done handler).
+        if not result.get("ok", False):
+            if response_active[0]:
+                pending_followup[0] = True
+            else:
+                await conn.send({"type": "response.create"})
+
     async def send_audio(conn):
         while not stop_event.is_set():
             try:
@@ -361,6 +503,7 @@ async def listen_and_play_realtime(
             elif event.type == "response.created":
                 clear_live_user_text()
                 assistant_transcript_buf[0] = ""
+                response_active[0] = True
                 print("ASSISTANT: <response started>", flush=True)
             elif event.type == "response.output_audio.delta":
                 audio = base64.b64decode(event.delta)
@@ -388,11 +531,18 @@ async def listen_and_play_realtime(
                     f"TOOL: {event.name} call_id={event.call_id} arguments={event.arguments}",
                     flush=True,
                 )
+                await handle_tool_call(conn, event.name, event.call_id, event.arguments)
             elif event.type == "response.done":
                 if event.response.status == "cancelled":
                     clear_playback_buffer()
                     set_face_state("idle")
+                response_active[0] = False
                 print(f"ASSISTANT: <response {event.response.status}>", flush=True)
+                # A tool failure arrived mid-response; now that it's closed, let
+                # the model speak to it.
+                if pending_followup[0]:
+                    pending_followup[0] = False
+                    await conn.send({"type": "response.create"})
             elif event.type == "error":
                 clear_live_user_text()
                 print(f"ERROR: {event.error.type}: {event.error.message}", flush=True)
@@ -417,14 +567,21 @@ async def listen_and_play_realtime(
         callback=callback_send,
         device=args.input_device,
     )
-    output_stream = sd.RawOutputStream(
-        samplerate=args.recv_rate,
-        channels=1,
-        dtype="int16",
-        blocksize=args.chunk_size,
-        callback=callback_recv,
-        device=args.output_device,
-    )
+    # If opening the speaker fails, release the mic we just opened — otherwise a
+    # crashed run leaks the capture device and blocks every retry (and confuses
+    # ALSA/PipeWire about who owns the card).
+    try:
+        output_stream = sd.RawOutputStream(
+            samplerate=args.recv_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=args.chunk_size,
+            callback=callback_recv,
+            device=args.output_device,
+        )
+    except BaseException:
+        input_stream.close()
+        raise
 
     input_stream.start()
     output_stream.start()
@@ -434,9 +591,20 @@ async def listen_and_play_realtime(
         face_server = await websockets.serve(face_handler, args.face_host, args.face_port)
         print(f"Face WS on ws://{args.face_host}:{args.face_port}", flush=True)
 
+    tools = None
+    if conductor_base is not None:
+        modes = DEFAULT_MODES
+        status = await asyncio.to_thread(_conductor_call, conductor_base, "/modes", None)
+        if isinstance(status.get("modes"), list) and status["modes"]:
+            modes = status["modes"]
+        else:
+            print(f"Conductor {conductor_base} unreachable; tools use default modes.", flush=True)
+        tools = _tool_specs(modes)
+        print(f"Robot tools enabled ({conductor_base}); modes={modes}", flush=True)
+
     try:
         async with client.realtime.connect(model=args.model) as conn:
-            await conn.send(_build_session_update(args))  # type: ignore[arg-type]
+            await conn.send(_build_session_update(args, tools))  # type: ignore[arg-type]
 
             sender_task = asyncio.create_task(send_audio(conn))
             receiver_task = asyncio.create_task(receive_events(conn))
@@ -499,6 +667,10 @@ def main() -> None:
     parser.add_argument("--face-port", type=int, default=defaults.face_port,
                         help="Face WebSocket port. Set to 0 to disable.")
     parser.add_argument("--face-rate", type=int, default=defaults.face_rate)
+    parser.add_argument("--conductor-host", default=defaults.conductor_host,
+                        help="Conductor behavior-tree API host (mode/preset tools).")
+    parser.add_argument("--conductor-port", type=int, default=defaults.conductor_port,
+                        help="Conductor API port. Set to 0 to disable robot tools.")
     namespace = parser.parse_args()
     args = ListenAndPlayRealtimeArguments(
         host=namespace.host,
@@ -519,6 +691,8 @@ def main() -> None:
         face_host=namespace.face_host,
         face_port=namespace.face_port,
         face_rate=namespace.face_rate,
+        conductor_host=namespace.conductor_host,
+        conductor_port=namespace.conductor_port,
     )
     try:
         asyncio.run(listen_and_play_realtime(args))

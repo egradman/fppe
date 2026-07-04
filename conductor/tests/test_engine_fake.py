@@ -102,6 +102,21 @@ def test_abort_disengages_base_source(engine):
     assert engine.ctx.client.snapshot().base_input_source == "off"  # not left engaged
 
 
+def test_interrupt_runs_then_restores_prior_mission(engine):
+    # This is the mechanism the voice `move_arms` tool rides on: a transient
+    # activity interrupts the current mode and the mode pops back when it ends.
+    engine.load_mission("teleop", load_mode("teleop"))
+    tick(engine, 2)
+    assert engine.current_mission() == "teleop"
+
+    # A one-shot activity (go_preset SUCCEEDs immediately) pushed via interrupt.
+    engine.interrupt("poke", {"type": "go_preset", "params": {"preset": "home"}})
+    tick(engine, 4)
+    # The interrupt ran and the previous mode was restored, not left as "poke".
+    assert engine.current_mission() == "teleop"
+    assert set(engine.ctx.senders.running()) == {"leader", "pedal"}
+
+
 def test_nav_stub_fails_gracefully(engine):
     engine.load_mission("nav", load_mode("nav"))
     tick(engine, 3)

@@ -879,6 +879,21 @@ def start_voice_thread(
     except OSError:
         instructions = None
 
+    # Pin to the ALSA "default" PCM by its exact PortAudio index. That PCM is the
+    # ~/.asoundrc plug that resamples for the Jabra (16k mono -> 48k stereo).
+    # PortAudio's *own* default-device pick is unreliable — it falls back to raw
+    # HDMI, which rejects our 16 kHz mono format. None => let PortAudio choose.
+    dev_idx = None
+    try:
+        import sounddevice as sd
+        dev_idx = next(
+            (i for i, d in enumerate(sd.query_devices()) if d["name"] == "default"),
+            None,
+        )
+    except Exception:
+        pass
+    print(f"Voice audio device: {'default'!r} -> index {dev_idx}", flush=True)
+
     vargs = voice.ListenAndPlayRealtimeArguments(
         host=host,
         port=port,
@@ -886,14 +901,24 @@ def start_voice_thread(
         face_host="0.0.0.0",
         face_port=face_port,
         instructions=instructions,
+        input_device=dev_idx,
+        output_device=dev_idx,
     )
 
     def _run():
-        try:
-            asyncio.run(voice.listen_and_play_realtime(vargs, stop_event))
-        except Exception:
-            print("== VOICE thread crashed (robot control unaffected) ==", flush=True)
-            traceback.print_exc()
+        # Keep voice alive across transient errors (device briefly busy at boot,
+        # speech server restart, network blip). Never fatal to robot control.
+        backoff = 2.0
+        while not stop_event.is_set():
+            try:
+                asyncio.run(voice.listen_and_play_realtime(vargs, stop_event))
+            except Exception:
+                print("== VOICE error (robot control unaffected); will retry ==", flush=True)
+                traceback.print_exc()
+            if stop_event.is_set():
+                break
+            stop_event.wait(backoff)
+            backoff = min(backoff * 1.5, 15.0)
 
     t = threading.Thread(target=_run, daemon=True, name="voice")
     t.start()
@@ -908,7 +933,13 @@ def main():
     parser = argparse.ArgumentParser(description="Viser web control panel for LeKiwi")
     parser.add_argument("--port", type=int, default=8090)
     parser.add_argument("--api-port", type=int, default=8091)
-    parser.add_argument("--serial-port", default="/dev/ttyACM0")
+    # Stable by-id path for fppe's motor-bus adapter (CH340). The bare
+    # /dev/ttyACM* numbering shuffles when other USB devices (Jabra, webcams)
+    # re-enumerate, so pin to the adapter's serial number instead.
+    parser.add_argument(
+        "--serial-port",
+        default="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6081221-if00",
+    )
     parser.add_argument("--cam0", default="/dev/video0", help="First camera device")
     parser.add_argument("--cam1", default="/dev/video2", help="Second camera device")
     parser.add_argument("--cam-width", type=int, default=640)
