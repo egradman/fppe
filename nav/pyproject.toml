@@ -1,0 +1,39 @@
+[project]
+name = "nav"
+version = "0.1.0"
+description = "Skynet-side visual-navigation (GNM/ViNT/NoMaD) inference for the LeKiwi base. Phase 1: offline model harness."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # --- torch (Blackwell / RTX 5080 sm_120 needs cu128 wheels) ---
+    "torch",
+    "torchvision",
+    # --- vendored ViNT model code needs these (see src/nav/models/) ---
+    "efficientnet-pytorch==0.7.1",
+    "gdown>=5.0",        # official-checkpoint download
+    "pyyaml",
+    # --- io / preprocessing ---
+    "numpy",
+    "pillow",
+    "opencv-python>=4.9",
+    # NoMaD (later phases) will add: vit-pytorch, diffusers, einops
+]
+
+[project.scripts]
+nav-harness = "nav.harness:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nav"]
+
+# Blackwell needs CUDA 12.8 torch wheels; pull torch/torchvision from PyTorch's cu128 index.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }

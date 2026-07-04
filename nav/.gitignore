@@ -1,0 +1,4 @@
+.venv/
+scratch/
+weights/
+__pycache__/

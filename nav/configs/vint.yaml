@@ -1,0 +1,20 @@
+# Trimmed ViNT config — only the keys get_model()/preprocessing read.
+# Full training config lives in the upstream visualnav-transformer repo.
+model_type: vint
+
+# model params
+obs_encoder: "efficientnet-b0"
+obs_encoding_size: 512
+mha_num_attention_heads: 4
+mha_num_attention_layers: 4
+mha_ff_dim_factor: 4
+late_fusion: False
+
+# context / trajectory
+context_size: 5          # ViNT stacks context_size+1 = 6 frames
+len_traj_pred: 5         # predicts 5 waypoints
+learn_angle: True        # each waypoint: (dx, dy, cos, sin) -> 4 params
+
+# preprocessing
+image_size: [85, 64]     # width, height (PIL resize order)
+normalize: True
