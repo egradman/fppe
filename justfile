@@ -28,9 +28,10 @@ viser *args: build-ui sync
     ssh fppe 'pkill -f "[v]iser_control.py"; sleep 2'
     ssh fppe 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate lerobot_alohamini && cd lerobot_alohamini && exec python -u examples/debug/viser_control.py {{args}}'
 
-# Host running `just listen` (voice/mac.justfile) that serves the face-animation
-# WebSockets (mouth/state/transcript on :8766, status on :8767).
-face_host := "nimbus"
+# Host serving the face-animation WebSockets (mouth/state/transcript on :8766).
+# Default localhost: voice runs on the Pi itself via viser_control --voice. Use
+# `just face_host=nimbus kiosk` to point at a Mac running voice/mac.justfile.
+face_host := "localhost"
 
 # Relaunch the fppe kiosk browser on the Face tab, pointing the face + status
 # WebSockets at {{face_host}}. Launches into the Pi's Wayland session, detached.
