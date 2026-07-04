@@ -1,9 +1,12 @@
-# nav — autonomous navigation to a named location.
+# nav — autonomous navigation to a named location on the topological route.
 #
-# STUB: navigate_to reports FAILURE until the Phase-3 nav integration lands
-# (a "nav" value in viser_control's BaseInputSource + a nav UDP sender). The
-# structure below is the real target shape.
-type: navigate_to
+# navigate_to is real as of Phase 3: nav-serve follows the loaded route's
+# breadcrumbs from the localized start to the labeled goal node. The label must
+# exist in the loaded route ('kitchen' is a house target); for the garage test
+# use the navigate_inward / navigate_outward modes.
+type: sequence
 name: nav
-params:
-  location: "kitchen"
+memory: true
+children:
+  - { type: set_base_source, params: { value: "auto" } }
+  - { type: navigate_to, params: { label: "kitchen" } }

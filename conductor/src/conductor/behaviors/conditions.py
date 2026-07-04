@@ -135,26 +135,3 @@ class Hold(RobotBehaviour):
 
     def update(self) -> Status:
         return Status.RUNNING
-
-
-@register(
-    "navigate_to",
-    "Autonomously drive the base to a named location. STUB: the nav base source "
-    "and UDP sender are not wired yet (Phase-3), so this reports FAILURE for now.",
-    {"location": {"type": "string", "description": "named waypoint, e.g. 'kitchen'"}},
-)
-class NavigateTo(RobotBehaviour):
-    """Phase-3 seam. When nav lands this becomes: start_sender(nav) +
-    set_base_source('nav') + hold-until AtLocation(location)."""
-
-    def __init__(self, ctx: Context, location: str, name: str | None = None):
-        super().__init__(ctx, name or f"navigate_to={location}", {"location": location})
-        self.location = location
-
-    def update(self) -> Status:
-        self.feedback_message = (
-            f"nav to {self.location!r} not available: nav base_input_source + sender "
-            "not yet wired (see viser_control BaseInputSource._VALUES and nav/)."
-        )
-        self.logger.warning(self.feedback_message)
-        return Status.FAILURE

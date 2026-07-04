@@ -1,0 +1,10 @@
+# navigate_outward — drive the base to the 'outward' location on the topological route.
+#
+# Mirror of navigate_inward for the other end of the garage tour. nav-serve picks
+# the nearest 'outward' instance to the localized start. See navigate_inward.yaml.
+type: sequence
+name: navigate_outward
+memory: true
+children:
+  - { type: set_base_source, params: { value: "auto" } }
+  - { type: navigate_to, params: { label: "outward" } }

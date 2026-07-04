@@ -6,9 +6,9 @@ type: sequence
 name: clean_room
 memory: true
 children:
-  - { type: navigate_to, params: { location: "kitchen" } }
+  - { type: navigate_to, params: { label: "kitchen" } }
   - { type: go_preset, params: { preset: "arms_up" } }
   - { type: sleep, params: { seconds: 2 } }
-  - { type: navigate_to, params: { location: "living_room" } }
+  - { type: navigate_to, params: { label: "living_room" } }
   - { type: go_preset, params: { preset: "home" } }
   - { type: hold, name: "clean_done" }

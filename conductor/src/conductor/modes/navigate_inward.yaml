@@ -1,0 +1,16 @@
+# navigate_inward — drive the base to the 'inward' location on the topological route.
+#
+# Phase 3 named-location nav. Selects the shared 'auto' base source, then asks
+# nav-serve to follow the loaded route's breadcrumbs from wherever the robot is
+# now to the node labeled 'inward', streaming ctx.base until it arrives (SUCCESS),
+# then the engine falls back to idle (base off).
+#
+# Requires on skynet: `nav-serve` up with a route loaded (--route <route.json>),
+# and viser_control on the Pi with the 'auto' UDP listener (default). Garage test:
+# park at the door end and run this — the goal is not visible from the start.
+type: sequence
+name: navigate_inward
+memory: true
+children:
+  - { type: set_base_source, params: { value: "auto" } }
+  - { type: navigate_to, params: { label: "inward" } }

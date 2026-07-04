@@ -117,8 +117,21 @@ def test_interrupt_runs_then_restores_prior_mission(engine):
     assert set(engine.ctx.senders.running()) == {"leader", "pedal"}
 
 
-def test_nav_stub_fails_gracefully(engine):
+def test_navigate_to_drives_then_completes(engine):
     engine.load_mission("nav", load_mode("nav"))
     tick(engine, 3)
-    # navigate_to is a stub that FAILUREs; engine falls back to idle.
+    # navigate_to is real (Phase 3): it selects the shared 'auto' base source and
+    # asks nav-serve (FakeNavClient here) to follow the route toward the label.
+    # While driving, the mission stays "nav".
+    snap = engine.ctx.client.snapshot()
+    assert snap.base_input_source == "auto"
+    assert engine.ctx.nav.routes and engine.ctx.nav.routes[-1]["label"] == "kitchen"
+    assert engine.current_mission() == "nav"
+
+    # When the fake reports the goal reached, navigate_to SUCCEEDs, the mode
+    # completes, and the engine falls back to idle (base off), clearing the route.
+    engine.ctx.nav.set_command(reached=True)
+    tick(engine, 3)
     assert engine.current_mission() == "idle"
+    assert engine.ctx.client.snapshot().base_input_source == "off"
+    assert engine.ctx.nav.routes_cleared >= 1

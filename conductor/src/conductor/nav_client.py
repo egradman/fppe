@@ -27,12 +27,14 @@ log = logging.getLogger(__name__)
 class NavCommand:
     online: bool = False       # was the service reachable this read?
     active: bool = False       # is a goal set and being driven toward?
-    reached: bool = False      # has the goal been reached (closest approach)?
+    reached: bool = False      # has the goal been reached (closest approach / final crumb)?
     vx: float = 0.0            # m/s +forward
     vy: float = 0.0            # m/s +strafe-left
     theta: float = 0.0         # deg/s +CCW
-    dist: float | None = None  # ViNT temporal distance to goal
+    dist: float | None = None  # ViNT temporal distance to current goal/breadcrumb
     reason: str = ""
+    node: int | None = None    # route mode: current target breadcrumb node id
+    leg: str = ""              # route mode: "k/N" progress through the breadcrumb sequence
 
 
 class NavClient:
@@ -50,6 +52,31 @@ class NavClient:
         except Exception as exc:
             log.debug("nav clear_goal failed: %s", exc)
 
+    def set_route(self, label: str | None = None, node: int | None = None,
+                  start: int | None = None) -> dict:
+        """Begin following the loaded route toward a label/node. Blocks while
+        nav-serve localizes the start node (several ViNT inferences), so this
+        gets a generous timeout, not the per-tick one."""
+        body: dict = {}
+        if label is not None:
+            body["label"] = label
+        if node is not None:
+            body["node"] = node
+        if start is not None:
+            body["start"] = start
+        try:
+            r = self._http.post("/route", json=body, timeout=20.0)
+            return r.json()
+        except Exception as exc:
+            log.debug("nav set_route failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    def clear_route(self) -> None:
+        try:
+            self._http.delete("/route")
+        except Exception as exc:
+            log.debug("nav clear_route failed: %s", exc)
+
     def get(self) -> NavCommand:
         try:
             r = self._http.get("/command")
@@ -66,6 +93,8 @@ class NavClient:
             theta=float(d.get("theta", 0.0)),
             dist=d.get("dist"),
             reason=str(d.get("reason", "")),
+            node=d.get("node"),
+            leg=str(d.get("leg", "")),
         )
 
     def close(self) -> None:
@@ -78,7 +107,9 @@ class FakeNavClient:
     def __init__(self) -> None:
         self._cmd = NavCommand(online=True)
         self.goals: list[bytes] = []
+        self.routes: list[dict] = []
         self.cleared = 0
+        self.routes_cleared = 0
 
     def set_goal(self, image_bytes: bytes) -> None:
         self.goals.append(image_bytes)
@@ -87,6 +118,16 @@ class FakeNavClient:
     def clear_goal(self) -> None:
         self.cleared += 1
         self._cmd = NavCommand(online=True, active=False, reason="cleared")
+
+    def set_route(self, label: str | None = None, node: int | None = None,
+                  start: int | None = None) -> dict:
+        self.routes.append({"label": label, "node": node, "start": start})
+        self._cmd = NavCommand(online=True, active=True, reason="route set")
+        return {"ok": True, "start": start or 0, "goal": node or 0, "sequence": []}
+
+    def clear_route(self) -> None:
+        self.routes_cleared += 1
+        self._cmd = NavCommand(online=True, active=False, reason="route cleared")
 
     def get(self) -> NavCommand:
         return self._cmd
