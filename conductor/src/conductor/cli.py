@@ -22,6 +22,7 @@ from conductor.context import Context
 from conductor.dsl import build_tree
 from conductor.engine import Engine
 from conductor.modes import list_modes, load_mode
+from conductor.nav_client import NavClient
 from conductor.perception import PerceptionClient
 from conductor.registry import catalog
 from conductor.senders import FakeSenderManager, SenderManager
@@ -51,7 +52,7 @@ def cmd_show(args) -> int:
     return 0
 
 
-def _real_ctx(host: str, api_port: int) -> Context:
+def _real_ctx(host: str, api_port: int, nav_url: str = "http://localhost:8107") -> Context:
     return Context(
         client=RobotClient(host=host, api_port=api_port),
         senders=SenderManager(fppe_host=host),
@@ -60,12 +61,15 @@ def _real_ctx(host: str, api_port: int) -> Context:
         # No detector wired yet: perception reports "not seen", so chase_dogs
         # degrades to an endless search. Attach detector=/frame_source= here.
         perception=PerceptionClient(),
+        # nav_to_goal reads its command from nav-serve (default :8107). If the
+        # service is down, NavToGoal reports offline and the mission fails to idle.
+        nav=NavClient(base_url=nav_url),
     )
 
 
 def cmd_run(args) -> int:
     dsl = load_mode(args.mode)
-    ctx = _real_ctx(args.host, args.api_port)
+    ctx = _real_ctx(args.host, args.api_port, args.nav_url)
     engine = Engine(ctx, tick_hz=args.tick_hz)
     engine.setup()
     engine.load_mission(args.mode, dsl)
@@ -91,7 +95,7 @@ def cmd_run(args) -> int:
 
 
 def cmd_serve(args) -> int:
-    ctx = _real_ctx(args.host, args.api_port)
+    ctx = _real_ctx(args.host, args.api_port, args.nav_url)
     engine = Engine(ctx, tick_hz=args.tick_hz)
     engine.setup()
     engine.load_mission(args.mode, load_mode(args.mode))  # boot mode
@@ -133,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("mode")
     sp.add_argument("--host", default="fppe", help="fppe hostname (default: fppe)")
     sp.add_argument("--api-port", type=int, default=8091)
+    sp.add_argument("--nav-url", default="http://localhost:8107", help="nav-serve base URL")
     sp.add_argument("--tick-hz", type=float, default=10.0)
     sp.set_defaults(func=cmd_run)
 
@@ -140,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--mode", default="idle", help="boot mode (default: idle)")
     sp.add_argument("--host", default="fppe", help="fppe hostname (default: fppe)")
     sp.add_argument("--api-port", type=int, default=8091, help="fppe viser_control port")
+    sp.add_argument("--nav-url", default="http://localhost:8107", help="nav-serve base URL")
     sp.add_argument("--bind", default="0.0.0.0", help="conductor API bind address")
     sp.add_argument("--port", type=int, default=8100, help="conductor API port (default: 8100)")
     sp.add_argument("--tick-hz", type=float, default=10.0)

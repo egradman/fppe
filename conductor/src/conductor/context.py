@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from conductor.base_cmd import BaseCmdChannel, FakeBaseCmdChannel
 from conductor.client import RobotClientBase
+from conductor.nav_client import FakeNavClient, NavClient
 from conductor.perception import FakePerceptionClient, PerceptionClient
 from conductor.senders import FakeSenderManager, SenderManager
 
@@ -26,3 +27,4 @@ class Context:
     fppe_host: str = "fppe"
     base: "BaseCmdChannel | FakeBaseCmdChannel" = field(default_factory=FakeBaseCmdChannel)
     perception: "PerceptionClient | FakePerceptionClient" = field(default_factory=FakePerceptionClient)
+    nav: "NavClient | FakeNavClient" = field(default_factory=FakeNavClient)

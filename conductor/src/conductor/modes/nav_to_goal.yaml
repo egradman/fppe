@@ -1,0 +1,16 @@
+# nav_to_goal — drive the base to a goal photo via the nav service.
+#
+# Selects the shared 'auto' base source, then hands the goal photo to nav-serve
+# and drives ctx.base from its command until the goal is reached (SUCCESS), at
+# which point the mode completes and the engine falls back to idle (base off).
+#
+# Requires on skynet: `uv run nav-serve` up (default :8107), and viser_control on
+# the Pi with the 'auto' UDP listener (default). The goal path is repo-root-
+# relative. This is the Phase-2 integration; navigate_to(<named location>) is
+# Phase 3 (needs the topological map).
+type: sequence
+name: nav_to_goal
+memory: true
+children:
+  - { type: set_base_source, params: { value: "auto" } }
+  - { type: nav_to_goal, params: { goal: "nav/scratch/goal.jpg" } }

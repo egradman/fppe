@@ -62,3 +62,53 @@ def waypoints_to_velocity(
         theta_vel = -theta_vel
 
     return x_vel, y_vel, theta_vel
+
+
+@dataclass
+class ApproachParams:
+    goal_dist: float = 2.0        # hard-stop distance
+    decel_range: float = 3.0      # ease speed over this band above goal_dist
+    min_speed_frac: float = 0.3   # creep-speed floor near the goal
+    overshoot_margin: float = 0.6 # stop when dist rises this far above its min
+
+
+class NavPlanner:
+    """Stateful per-goal planner shared by the standalone executor and the
+    service. Turns each (distance, waypoints) inference into a body velocity with
+    approach deceleration, and decides when the goal is reached.
+
+    Reached = distance crossed `goal_dist`, OR (once inside the approach band) the
+    distance has risen `overshoot_margin` above its running minimum — the
+    closest-approach detector, robust to ViNT's distance head plateauing above
+    `goal_dist`.
+    """
+
+    def __init__(self, base_speed: float, gains: ControlGains, approach: ApproachParams):
+        self.base_speed = base_speed
+        self.gains = gains
+        self.approach = approach
+        self.min_dist = float("inf")
+        self.engaged = False
+
+    def reset(self):
+        self.min_dist = float("inf")
+        self.engaged = False
+
+    def step(self, dist: float, action) -> tuple[tuple[float, float, float], bool, str]:
+        """Return ((x_vel, y_vel, theta_vel), reached, reason)."""
+        a = self.approach
+        self.min_dist = min(self.min_dist, dist)
+        if dist <= a.goal_dist + a.decel_range:
+            self.engaged = True
+
+        if dist < a.goal_dist:
+            return (0.0, 0.0, 0.0), True, f"dist {dist:.2f} < goal_dist {a.goal_dist}"
+        if self.engaged and dist > self.min_dist + a.overshoot_margin:
+            return (0.0, 0.0, 0.0), True, (
+                f"passed closest approach (min {self.min_dist:.2f}, now {dist:.2f})"
+            )
+
+        span = max(a.decel_range, 1e-6)
+        frac = max(a.min_speed_frac, min(1.0, (dist - a.goal_dist) / span))
+        self.gains.cruise_speed = self.base_speed * frac
+        return waypoints_to_velocity(action, self.gains), False, "driving"
