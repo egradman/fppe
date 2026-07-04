@@ -23,6 +23,7 @@ nav-harness = "nav.harness:main"
 nav-drive = "nav.executor:drive_main"
 nav-snap = "nav.executor:snap_main"
 nav-serve = "nav.service:main"
+nav-build-route = "nav.route:main"
 
 [build-system]
 requires = ["hatchling"]

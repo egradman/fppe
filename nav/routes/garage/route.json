@@ -1,0 +1,260 @@
+{
+  "name": "vivid-maple",
+  "kind": "linear",
+  "source": "/home/egradman/dev/fppe/nav/scratch/vivid-maple",
+  "created": "2026-07-04T12:31:06",
+  "spacing_m": 0.5,
+  "heading_deg": 30.0,
+  "n_frames_in": 320,
+  "nodes": [
+    {
+      "id": 0,
+      "src_frame": 0,
+      "x": 0.0,
+      "y": 0.0,
+      "heading": 0.0,
+      "file": "nodes/000.jpg",
+      "labels": []
+    },
+    {
+      "id": 1,
+      "src_frame": 7,
+      "x": 0.0,
+      "y": 0.0,
+      "heading": 0.0,
+      "file": "nodes/001.jpg",
+      "labels": [
+        "inward"
+      ]
+    },
+    {
+      "id": 2,
+      "src_frame": 38,
+      "x": 0.5306,
+      "y": 0.0004,
+      "heading": 0.0033,
+      "file": "nodes/002.jpg",
+      "labels": []
+    },
+    {
+      "id": 3,
+      "src_frame": 52,
+      "x": 1.0256,
+      "y": 0.1008,
+      "heading": 0.416,
+      "file": "nodes/003.jpg",
+      "labels": []
+    },
+    {
+      "id": 4,
+      "src_frame": 65,
+      "x": 1.4358,
+      "y": 0.3868,
+      "heading": 0.8866,
+      "file": "nodes/004.jpg",
+      "labels": []
+    },
+    {
+      "id": 5,
+      "src_frame": 77,
+      "x": 1.6405,
+      "y": 0.8147,
+      "heading": 1.4407,
+      "file": "nodes/005.jpg",
+      "labels": []
+    },
+    {
+      "id": 6,
+      "src_frame": 90,
+      "x": 1.5932,
+      "y": 1.3309,
+      "heading": 1.7264,
+      "file": "nodes/006.jpg",
+      "labels": []
+    },
+    {
+      "id": 7,
+      "src_frame": 103,
+      "x": 1.4809,
+      "y": 1.8401,
+      "heading": 1.9911,
+      "file": "nodes/007.jpg",
+      "labels": []
+    },
+    {
+      "id": 8,
+      "src_frame": 108,
+      "x": 1.3799,
+      "y": 1.9897,
+      "heading": 2.5286,
+      "file": "nodes/008.jpg",
+      "labels": []
+    },
+    {
+      "id": 9,
+      "src_frame": 117,
+      "x": 1.0578,
+      "y": 2.1088,
+      "heading": 3.1514,
+      "file": "nodes/009.jpg",
+      "labels": []
+    },
+    {
+      "id": 10,
+      "src_frame": 138,
+      "x": 0.6087,
+      "y": 2.0425,
+      "heading": 3.3635,
+      "file": "nodes/010.jpg",
+      "labels": [
+        "outward"
+      ]
+    },
+    {
+      "id": 11,
+      "src_frame": 158,
+      "x": 0.6055,
+      "y": 2.0921,
+      "heading": 2.7767,
+      "file": "nodes/011.jpg",
+      "labels": []
+    },
+    {
+      "id": 12,
+      "src_frame": 163,
+      "x": 0.6133,
+      "y": 2.1125,
+      "heading": 2.2173,
+      "file": "nodes/012.jpg",
+      "labels": []
+    },
+    {
+      "id": 13,
+      "src_frame": 168,
+      "x": 0.6135,
+      "y": 2.1125,
+      "heading": 1.6309,
+      "file": "nodes/013.jpg",
+      "labels": []
+    },
+    {
+      "id": 14,
+      "src_frame": 176,
+      "x": 0.6138,
+      "y": 2.1125,
+      "heading": 1.0713,
+      "file": "nodes/014.jpg",
+      "labels": []
+    },
+    {
+      "id": 15,
+      "src_frame": 184,
+      "x": 0.6597,
+      "y": 2.085,
+      "heading": 0.5113,
+      "file": "nodes/015.jpg",
+      "labels": []
+    },
+    {
+      "id": 16,
+      "src_frame": 195,
+      "x": 0.8953,
+      "y": 2.0336,
+      "heading": -0.081,
+      "file": "nodes/016.jpg",
+      "labels": []
+    },
+    {
+      "id": 17,
+      "src_frame": 202,
+      "x": 0.9811,
+      "y": 1.8044,
+      "heading": -0.7414,
+      "file": "nodes/017.jpg",
+      "labels": []
+    },
+    {
+      "id": 18,
+      "src_frame": 207,
+      "x": 0.9177,
+      "y": 1.6147,
+      "heading": -1.3153,
+      "file": "nodes/018.jpg",
+      "labels": []
+    },
+    {
+      "id": 19,
+      "src_frame": 223,
+      "x": 0.9539,
+      "y": 1.0784,
+      "heading": -1.8719,
+      "file": "nodes/019.jpg",
+      "labels": []
+    },
+    {
+      "id": 20,
+      "src_frame": 233,
+      "x": 0.7835,
+      "y": 0.7345,
+      "heading": -2.4116,
+      "file": "nodes/020.jpg",
+      "labels": []
+    },
+    {
+      "id": 21,
+      "src_frame": 244,
+      "x": 0.3807,
+      "y": 0.5161,
+      "heading": -3.0076,
+      "file": "nodes/021.jpg",
+      "labels": []
+    },
+    {
+      "id": 22,
+      "src_frame": 257,
+      "x": -0.1304,
+      "y": 0.599,
+      "heading": -3.3717,
+      "file": "nodes/022.jpg",
+      "labels": []
+    },
+    {
+      "id": 23,
+      "src_frame": 270,
+      "x": -0.6407,
+      "y": 0.7183,
+      "heading": -3.369,
+      "file": "nodes/023.jpg",
+      "labels": []
+    },
+    {
+      "id": 24,
+      "src_frame": 283,
+      "x": -1.1282,
+      "y": 0.8895,
+      "heading": -3.6059,
+      "file": "nodes/024.jpg",
+      "labels": []
+    },
+    {
+      "id": 25,
+      "src_frame": 302,
+      "x": -1.513,
+      "y": 1.1735,
+      "heading": -3.9609,
+      "file": "nodes/025.jpg",
+      "labels": [
+        "outward"
+      ]
+    }
+  ],
+  "labels": {
+    "inward": [
+      1
+    ],
+    "outward": [
+      10,
+      25
+    ]
+  }
+}
