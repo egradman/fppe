@@ -1,0 +1,16 @@
+[Unit]
+Description=Speech-to-Speech realtime voice server (Parakeet STT + Gemma/Cerebras LLM + Qwen3-TTS)
+After=network-online.target
+Wants=network-online.target
+PartOf=purple.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/s2s-server.sh
+Restart=on-failure
+RestartSec=10
+# STT/TTS weights + CUDA-graph warmup take ~90s on first start
+TimeoutStartSec=300
+
+[Install]
+WantedBy=purple.target

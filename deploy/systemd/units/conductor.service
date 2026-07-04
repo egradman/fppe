@@ -1,0 +1,15 @@
+[Unit]
+Description=fppe behavior-tree conductor (modes/actuation) — Purple's orchestrator
+After=network-online.target nav-serve.service
+Wants=network-online.target
+PartOf=purple.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/conductor-server.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+
+[Install]
+WantedBy=purple.target

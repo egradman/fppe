@@ -1,0 +1,16 @@
+[Unit]
+Description=fppe visual-navigation service (ViNT) — Purple's nav brain
+After=network-online.target
+Wants=network-online.target
+PartOf=purple.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nav-serve.sh
+Restart=on-failure
+RestartSec=10
+# ViNT checkpoint load + CUDA warmup on first start.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=purple.target

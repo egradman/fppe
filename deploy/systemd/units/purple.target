@@ -1,0 +1,11 @@
+[Unit]
+Description=Purple — the full skynet-side brain (voice + vision + conductor + nav)
+# The single start/stop knob for Purple's brain:
+#   systemctl --user start  purple.target   # everything up
+#   systemctl --user stop   purple.target   # everything down (PartOf on each svc)
+#   systemctl --user restart purple.target
+# Members pull themselves in via [Install] WantedBy=purple.target (once enabled).
+# Not enabled on default.target -> manual only; nothing autostarts at boot.
+#
+# Scope: Purple's BRAIN on skynet. Purple's BODY (viser_control --voice on the
+# Pi) is autostarted by labwc on the Pi and is not managed here.
