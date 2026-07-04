@@ -196,24 +196,60 @@ and voice layers are all just clients of the same small HTTP/UDP surface.
 
 Ports, at a glance:
 
-| Host   | Service                 | Port(s)              | Start                                   |
-|--------|-------------------------|----------------------|-----------------------------------------|
-| fppe   | `viser_control` (+voice)| 8091, 9999/9998 UDP  | `just viser` / labwc autostart          |
-| skynet | conductor               | 8100                 | `just conductor serve` (systemd-able)   |
-| skynet | vision                  | 8102                 | `just vision serve --preload` (systemd) |
-| skynet | speech-to-speech        | 8765                 | `speech-to-speech.service` (systemd)    |
+| Host   | Service                  | Port(s)                  | Managed by                       |
+|--------|--------------------------|--------------------------|----------------------------------|
+| fppe   | `viser_control` (+voice) | 8091, 9999/9998/9997 UDP | `just viser` / labwc autostart   |
+| skynet | conductor                | 8100                     | `purple.target` (systemd --user) |
+| skynet | nav-serve (ViNT)         | 8107                     | `purple.target` (systemd --user) |
+| skynet | vision (Moondream)       | 8102                     | `purple.target` (systemd --user) |
+| skynet | speech-to-speech         | 8765                     | `purple.target` (systemd --user) |
 
-The skynet services (`speech-to-speech.service`, `vision.service`) run as
-**user systemd units** with lingering enabled, so they come up on boot. Deploy code
-to the Pi with `just sync` (rsync of the repo to `fppe:lerobot_alohamini/`); a Pi
-reboot relaunches `viser_control --voice`, which reconnects the voice client so it
-re-declares its tools.
+fppe UDP ports: **9999** leader arms, **9998** pedals, **9997** the shared `auto`
+autonomous-base source the conductor drives (nav today, chase later).
+
+### Starting / stopping Purple's brain — `purple.target`
+
+Purple's four skynet services are grouped under one **user systemd target**, so the
+whole brain starts and stops as a unit:
+
+```bash
+systemctl --user start   purple.target    # everything up
+systemctl --user stop    purple.target    # everything down
+systemctl --user restart purple.target
+systemctl --user status  purple.target
+journalctl --user -u conductor -f         # tail one service's logs
+systemctl --user restart nav-serve        # bounce just one
+```
+
+- **Members:** `speech-to-speech.service` (:8765) · `vision.service` (:8102) ·
+  `nav-serve.service` (:8107) · `conductor.service` (:8100). Each is `PartOf=`
+  the target (so `stop`/`restart` propagate to it) and `WantedBy=purple.target`
+  (so the target pulls it up). `nav-serve` is ordered before `conductor` (whose
+  `NavClient` reads it); none hard-depend on the Pi — they retry / report offline
+  when `fppe` is down.
+- **Manual, not boot:** the target is intentionally **not** enabled on
+  `default.target` — nothing autostarts at power-on; you bring Purple up
+  explicitly. (To make it boot automatically instead:
+  `systemctl --user enable purple.target && loginctl enable-linger egradman`.)
+- **Where it lives:** thin units in `~/.config/systemd/user/` (`conductor`,
+  `nav-serve`, `vision`, `speech-to-speech` `.service` + `purple.target`); each
+  `ExecStart=`s a wrapper in `~/.local/bin/*-server.sh` that `cd`s into the project
+  and `exec uv run …`.
+
+Scope: this target is Purple's **brain on skynet**. Purple's **body** —
+`viser_control --voice` on the Pi — is autostarted by labwc *on the Pi* and is not
+part of the target. Deploy code to the Pi with `just sync` (rsync to
+`fppe:lerobot_alohamini/`); a Pi reboot relaunches `viser_control --voice`, which
+reconnects the voice client so it re-declares its tools.
 
 ## Roadmap
 
-- **Navigation** (`nav/`) — the reason vision came first. LM-Nav/ViNT topological
-  nav on the LeKiwi base; wires in as `base_input_source == "nav"` + a nav UDP
-  sender, and becomes a real conductor mode. See `nav/README.md`.
+- **Navigation** (`nav/`) — the reason vision came first. ViNT visual nav on the
+  LeKiwi base. **Phase 2 works on hardware:** `nav-serve` (ViNT) + the `nav_to_goal`
+  conductor mode drive the base to a goal photo via the shared `auto` base source
+  (:9997), decelerating to a clean stop. Next: the topological map (teleop tour +
+  labels) to turn `nav_to_goal(<photo>)` into `navigate_to(<named location>)`.
+  See `nav/README.md`.
 - **LLM tree composition** — the conductor's `/catalog` + DSL round-trip
   (`build_tree` ⇄ `tree_to_dsl`) are the substrate for an LLM that *assembles and
   edits behavior trees at runtime*, not just picks from named modes.
