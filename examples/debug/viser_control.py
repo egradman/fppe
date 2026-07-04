@@ -775,6 +775,12 @@ def start_base_udp_listener(
         "last_fresh": 0.0,
         "active": False,
         "last_lift": "stop",
+        # Wheels are only put in velocity mode at boot / e-stop-release; a servo
+        # power-blip or mode change can leave them in position mode, where
+        # Goal_Velocity writes are silently inert (the wheels just hold stiff).
+        # So we (re)assert velocity mode on the edge where we START commanding,
+        # instead of assuming boot-time setup still holds.
+        "vmode_set": False,
     }
 
     def _stop_wheels():
@@ -821,9 +827,22 @@ def start_base_udp_listener(
                 if base_input_source.value != source_name or estop.engaged:
                     state["active"] = False
                     state["last_lift"] = "stop"
+                    state["vmode_set"] = False  # re-assert velocity mode on next activation
                     continue
 
                 if wheels_available:
+                    # Explicitly ensure the wheels are in velocity mode before we
+                    # command velocity — don't assume boot-time setup still holds.
+                    # Once per activation (cheap: setup toggles torque + has
+                    # sleeps, so we gate it on vmode_set, not per-packet).
+                    if not state["vmode_set"]:
+                        try:
+                            setup_wheels_velocity_mode(bus)
+                            state["vmode_set"] = True
+                        except Exception as e:
+                            if now - state["last_warn"] > 1.0:
+                                print(f"{log}: wheel velocity-mode setup failed: {e}")
+                                state["last_warn"] = now
                     # Per-wheel bus.write, matching the proven web-gamepad path
                     # (process_gamepad). sync_write("Goal_Velocity", ...) silently
                     # produced no motion here — the sign-magnitude encoding of
@@ -855,6 +874,7 @@ def start_base_udp_listener(
                             cmd_queue.put(("lift_stop",))
                             state["last_lift"] = "stop"
                     state["active"] = False
+                    state["vmode_set"] = False  # re-assert velocity mode on next activation
 
     t = threading.Thread(target=_run, daemon=True, name=thread_name)
     t.start()
@@ -1605,6 +1625,15 @@ def main():
         fresh = enabled and age < GAMEPAD_WATCHDOG_S
 
         if fresh:
+            # Ensure velocity mode on the edge into gamepad driving — don't
+            # assume boot-time setup still holds (a servo blip can drop the
+            # wheels into position mode, where Goal_Velocity is silently inert).
+            if wheels_ready and not teleop_active["on"]:
+                try:
+                    setup_wheels_velocity_mode(bus)
+                except Exception as e:
+                    print(f"Gamepad: wheel velocity-mode setup failed: {e}")
+
             axes = apply_deadzone(axes)
             if len(axes) >= 3:
                 x_cmd = -axes[1] * LIN_SPEED
