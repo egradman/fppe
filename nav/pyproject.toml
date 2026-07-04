@@ -20,6 +20,8 @@ dependencies = [
 
 [project.scripts]
 nav-harness = "nav.harness:main"
+nav-drive = "nav.executor:drive_main"
+nav-snap = "nav.executor:snap_main"
 
 [build-system]
 requires = ["hatchling"]
