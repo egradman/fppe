@@ -18,7 +18,7 @@ HTTP API (on --api-port, default 8091):
   POST /lift                 — {"action": "up"|"down"|"stop"}
   POST /gamepad              — {"axes": [...], "buttons": [bool, ...], "enabled": bool}
   POST /teleop_mode          — {"mode": "local"|"remote"} — see TeleopMode
-  POST /base_input_source    — {"value": "off"|"gamepad"|"pedals"} — see BaseInputSource
+  POST /base_input_source    — {"value": "off"|"gamepad"|"pedals"|"nav"} — see BaseInputSource
 
 The /state response includes "estop_engaged" (bool) read from a Raspberry Pi
 GPIO pin (default GPIO19). The e-stop is inline with motor power, so when
@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import queue
 import signal
 import socket
@@ -380,12 +381,15 @@ class BaseInputSource:
     'gamepad' — the web gamepad's axes/buttons drive wheels + lift.
     'pedals'  — UDP packets from the skynet-side pedal_teleop drive wheels +
                 lift. The web gamepad is silently dropped for the base.
+    'nav'     — UDP packets from the skynet-side nav executor (visual nav)
+                drive the wheels. Same PedalPacket wire format as 'pedals',
+                on its own port. The web gamepad is silently dropped.
 
     Disjoint from TeleopMode, which gates the arms. E-stop overrides both.
     Default is 'off' — explicit-enable for safety.
     """
 
-    _VALUES = ("off", "gamepad", "pedals")
+    _VALUES = ("off", "gamepad", "pedals", "nav")
 
     def __init__(self, initial: str = "off"):
         self._lock = threading.Lock()
@@ -601,11 +605,12 @@ class APIHandler(BaseHTTPRequestHandler):
             self._json_response(200, {"ok": True, "mode": self.teleop_mode.mode})
 
         elif self.path == "/base_input_source":
-            # {"value": "off"|"gamepad"|"pedals"}
+            # {"value": "off"|"gamepad"|"pedals"|"nav"}
             value = body.get("value")
             if not self.base_input_source.set(value):
                 self._json_response(
-                    400, {"error": "value must be 'off', 'gamepad', or 'pedals'"}
+                    400,
+                    {"error": "value must be 'off', 'gamepad', 'pedals', or 'nav'"},
                 )
                 return
             # Any source change immediately halts the base + lift so the next
@@ -741,14 +746,24 @@ def start_leader_udp_listener(
 # watchdog: if no fresh packet arrives, wheels + lift are stopped exactly
 # once on the stale edge.
 # ---------------------------------------------------------------------------
-def start_pedal_udp_listener(
+def start_base_udp_listener(
     port: int,
     bus: FeetechMotorsBus,
     base_input_source: "BaseInputSource",
     estop: "EstopMonitor",
     wheels_available: bool,
     cmd_queue: queue.Queue,
+    source_name: str = "pedals",
+    thread_name: str = "pedal-udp",
 ) -> tuple[socket.socket, threading.Thread]:
+    """Receive PedalPacket-shaped base commands on `port` and drive the wheels
+    (+ lift) whenever `base_input_source` currently equals `source_name`.
+
+    Used for both the pedal teleop stream ('pedals', :9998) and the visual-nav
+    executor stream ('nav', :9997) — identical wire format, disjoint ports, each
+    gated on its own source value so exactly one owns the base at a time.
+    """
+    log = f"{source_name.capitalize()} UDP"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", port))
@@ -765,15 +780,11 @@ def start_pedal_udp_listener(
     def _stop_wheels():
         if not wheels_available:
             return
-        try:
-            with _BUS_LOCK:
-                bus.sync_write(
-                    "Goal_Velocity",
-                    {n: 0 for n in WHEEL_NAMES},
-                    normalize=False,
-                )
-        except Exception as e:
-            print(f"Pedal UDP: wheel-stop write failed: {e}")
+        for name in WHEEL_NAMES:
+            try:
+                _bus_write(bus, "Goal_Velocity", name, 0)
+            except Exception as e:
+                print(f"{log}: wheel-stop write failed ({name}): {e}")
 
     def _run():
         while True:
@@ -793,7 +804,7 @@ def start_pedal_udp_listener(
                     pkt = pedal_wire.decode(data)
                 except Exception as e:
                     if now - state["last_warn"] > 1.0:
-                        print(f"Pedal UDP: decode error: {e}")
+                        print(f"{log}: decode error: {e}")
                         state["last_warn"] = now
                     continue
 
@@ -807,20 +818,25 @@ def start_pedal_udp_listener(
                 # Drop if not the selected source or e-stopped — but keep
                 # tracking last_fresh so the watchdog doesn't fire spuriously
                 # when the source is intentionally off.
-                if base_input_source.value != "pedals" or estop.engaged:
+                if base_input_source.value != source_name or estop.engaged:
                     state["active"] = False
                     state["last_lift"] = "stop"
                     continue
 
                 if wheels_available:
+                    # Per-wheel bus.write, matching the proven web-gamepad path
+                    # (process_gamepad). sync_write("Goal_Velocity", ...) silently
+                    # produced no motion here — the sign-magnitude encoding of
+                    # negative wheel velocities didn't round-trip the same way it
+                    # does through the individual write path.
                     cmds = body_to_wheel_raw(pkt.x_vel, pkt.y_vel, pkt.theta_vel)
-                    try:
-                        with _BUS_LOCK:
-                            bus.sync_write("Goal_Velocity", cmds, normalize=False)
-                    except Exception as e:
-                        if now - state["last_warn"] > 1.0:
-                            print(f"Pedal UDP: wheel write failed: {e}")
-                            state["last_warn"] = now
+                    for name, raw in cmds.items():
+                        try:
+                            _bus_write(bus, "Goal_Velocity", name, raw)
+                        except Exception as e:
+                            if now - state["last_warn"] > 1.0:
+                                print(f"{log}: wheel write failed ({name}): {e}")
+                                state["last_warn"] = now
 
                 # Only enqueue lift commands on transition — process_commands
                 # writes Goal_Velocity for lift each time, and at 100 Hz we'd
@@ -833,16 +849,16 @@ def start_pedal_udp_listener(
             else:
                 # No packet this iteration — check watchdog.
                 if state["active"] and (now - state["last_fresh"]) > GAMEPAD_WATCHDOG_S:
-                    if base_input_source.value == "pedals" and not estop.engaged:
+                    if base_input_source.value == source_name and not estop.engaged:
                         _stop_wheels()
                         if state["last_lift"] != "stop":
                             cmd_queue.put(("lift_stop",))
                             state["last_lift"] = "stop"
                     state["active"] = False
 
-    t = threading.Thread(target=_run, daemon=True, name="pedal-udp")
+    t = threading.Thread(target=_run, daemon=True, name=thread_name)
     t.start()
-    print(f"Pedal UDP listener: 0.0.0.0:{port}")
+    print(f"{log} listener: 0.0.0.0:{port}  (source='{source_name}')")
     return sock, t
 
 
@@ -966,6 +982,13 @@ def main():
         type=int,
         default=pedal_wire.DEFAULT_PORT,
         help="UDP port to receive pedal-derived base commands from skynet. 0 disables.",
+    )
+    parser.add_argument(
+        "--nav-udp-port",
+        type=int,
+        default=9997,
+        help="UDP port to receive visual-nav base commands (PedalPacket wire) "
+        "from the skynet nav executor. 0 disables.",
     )
     parser.add_argument(
         "--voice",
@@ -1275,6 +1298,29 @@ def main():
         btn_z_down = server.gui.add_button("Z Down", color="orange")
         btn_z_stop = server.gui.add_button("Z Stop", color="gray")
 
+    # ---- System tab ----
+    # Restart button: exits this process so the autostart supervisor loop
+    # relaunches a fresh one — the way to reload freshly-synced code (and pick up
+    # env like ANTHROPIC_API_KEY) without a reboot. An "Arm restart" checkbox
+    # gates it so a stray tap on the kiosk touchscreen can't kill robot control.
+    with tabs.add_tab("System"):
+        cb_restart_arm = server.gui.add_checkbox("Arm restart", initial_value=False)
+        btn_restart = server.gui.add_button("Restart viser", color="red")
+
+    @btn_restart.on_click
+    def _(_):
+        if not cb_restart_arm.value:
+            print("[gui] restart clicked but not armed; check 'Arm restart' first", flush=True)
+            return
+        print("[gui] restart requested — exiting for supervisor relaunch", flush=True)
+        # os._exit (not pkill -f viser_control.py): a hard exit of THIS process
+        # tears down every daemon thread (voice, UDP listeners, HTTP API) and the
+        # kernel reclaims the serial/audio fds, so the relaunched process can grab
+        # them. Name-based pkill would also match the bash supervisor's own
+        # command line (it contains "viser_control.py") and kill the loop meant
+        # to relaunch us. Motors hold their last goal position across the gap.
+        os._exit(0)
+
     # ---- HTTP API (started after the GUI build so port 8091 only opens
     # once viser's tab tree is ready; the kiosk autostart waits on 8091) ----
     start_api_server(
@@ -1300,13 +1346,28 @@ def main():
 
     # ---- Pedal UDP listener (skynet -> fppe pedal-derived base stream) ----
     if args.pedal_udp_port > 0:
-        start_pedal_udp_listener(
+        start_base_udp_listener(
             args.pedal_udp_port,
             bus,
             base_input_source=base_input_source,
             estop=estop,
             wheels_available=wheels_ready,
             cmd_queue=cmd_q,
+            source_name="pedals",
+            thread_name="pedal-udp",
+        )
+
+    # ---- Nav UDP listener (skynet -> fppe visual-nav base stream) ----
+    if args.nav_udp_port > 0:
+        start_base_udp_listener(
+            args.nav_udp_port,
+            bus,
+            base_input_source=base_input_source,
+            estop=estop,
+            wheels_available=wheels_ready,
+            cmd_queue=cmd_q,
+            source_name="nav",
+            thread_name="nav-udp",
         )
 
     # ---- Voice pipeline (mic/speaker <-> skynet speech server + Face tab) ----
